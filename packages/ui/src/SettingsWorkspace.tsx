@@ -27,6 +27,16 @@ import {
   type AutoAdvanceMode,
 } from './culling';
 import {
+  DEFAULT_SORT_CHANGED_EVENT,
+  SORT_DIRECTION_OPTIONS,
+  SORT_FIELD_OPTIONS,
+  readDefaultLibrarySort,
+  writeDefaultLibrarySort,
+  type LibrarySortDirection,
+  type LibrarySortField,
+  type LibrarySortPreference,
+} from './sort-preferences';
+import {
   readOverlayFades,
   readToolbarAutoHide,
   writeOverlayFades,
@@ -40,6 +50,9 @@ import { SHORTCUT_GROUPS } from './keymap';
 import type { WorkspaceSection } from './workspace';
 
 function CullingSettings() {
+  const [defaultSort, setDefaultSort] = createSignal<LibrarySortPreference>(
+    readDefaultLibrarySort(),
+  );
   const [autoMode, setAutoMode] = createSignal<AutoAdvanceMode>(readAutoAdvanceMode());
   const [pregenerate, setPregenerate] = createSignal(readPregenerate());
   const [watching, setWatching] = createSignal(readWatchLibraries());
@@ -50,12 +63,48 @@ function CullingSettings() {
     void execute<XmpPolicy>('xmp.policy.get')
       .then((res) => setXmpAutoWrite(res?.auto_write ?? true))
       .catch(() => undefined);
-    const syncAutoMode = () => setAutoMode(readAutoAdvanceMode());
-    window.addEventListener('storage', syncAutoMode);
-    onCleanup(() => window.removeEventListener('storage', syncAutoMode));
+    const syncPrefs = () => {
+      setAutoMode(readAutoAdvanceMode());
+      setDefaultSort(readDefaultLibrarySort());
+    };
+    window.addEventListener('storage', syncPrefs);
+    window.addEventListener(DEFAULT_SORT_CHANGED_EVENT, syncPrefs);
+    onCleanup(() => {
+      window.removeEventListener('storage', syncPrefs);
+      window.removeEventListener(DEFAULT_SORT_CHANGED_EVENT, syncPrefs);
+    });
   });
   return (
     <Group title="浏览与选片">
+      <ListRow
+        title="图片库默认排序"
+        labelFor="library-default-sort"
+        description="进入任一图片库或点击“重置视图”时默认应用的排序方式；浏览时在工具栏切换排序仅作用于当前会话。"
+        control={
+          <>
+            <Select
+              id="library-default-sort"
+              size="sm"
+              value={defaultSort().sortBy}
+              onChange={(value) => {
+                setDefaultSort(writeDefaultLibrarySort({ sortBy: value as LibrarySortField }));
+              }}
+              options={SORT_FIELD_OPTIONS}
+            />
+            <Select
+              aria-label="默认排序方向"
+              size="sm"
+              value={defaultSort().direction}
+              onChange={(value) => {
+                setDefaultSort(
+                  writeDefaultLibrarySort({ direction: value as LibrarySortDirection }),
+                );
+              }}
+              options={SORT_DIRECTION_OPTIONS}
+            />
+          </>
+        }
+      />
       <ListRow
         title="打标后自动下一张"
         labelFor="cull-auto-advance"

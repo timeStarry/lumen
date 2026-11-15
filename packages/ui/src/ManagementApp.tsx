@@ -100,6 +100,12 @@ import LibraryViewOptions, {
   SORT_OPTIONS,
   sortSelectTitle,
 } from './library/LibraryViewOptions';
+import {
+  DEFAULT_SORT_CHANGED_EVENT,
+  DEFAULT_THUMB_SIZE,
+  readDefaultLibrarySort,
+  type LibrarySortPreference,
+} from './sort-preferences';
 import DateScrubber from './wall/DateScrubber';
 import { fitRect, fly } from './zoom-transition';
 import { createFeedback, FeedbackStack } from './feedback';
@@ -168,9 +174,14 @@ export default function ManagementApp() {
   }
   const [total, setTotal] = createSignal(0);
   const [fileTotal, setFileTotal] = createSignal<number>();
-  const [sort, setSort] = createSignal<NonNullable<AssetListOptions['sort_by']>>('captured_at');
-  const [direction, setDirection] =
-    createSignal<NonNullable<AssetListOptions['sort_direction']>>('desc');
+  const initialSort = readDefaultLibrarySort();
+  const [defaultSort, setDefaultSort] = createSignal<LibrarySortPreference>(initialSort);
+  const [sort, setSort] = createSignal<NonNullable<AssetListOptions['sort_by']>>(
+    initialSort.sortBy,
+  );
+  const [direction, setDirection] = createSignal<NonNullable<AssetListOptions['sort_direction']>>(
+    initialSort.direction,
+  );
   const [burstStacks, setBurstStacks] = createSignal(readBurstStacks());
   const [expandedStacks, setExpandedStacks] = createSignal<ReadonlySet<string>>(new Set());
   function toggleBurstStacks(next?: boolean) {
@@ -651,6 +662,10 @@ export default function ManagementApp() {
       /* Only affects which library opens next time. */
     }
     request++;
+    const preferredSort = readDefaultLibrarySort();
+    setDefaultSort(preferredSort);
+    setSort(preferredSort.sortBy);
+    setDirection(preferredSort.direction);
     setAssets([]);
     setTotal(0);
     selection.reset(undefined);
@@ -2548,9 +2563,20 @@ export default function ManagementApp() {
     updateNavigationMode();
     navigationMedia.addEventListener('change', updateNavigationMode);
     const stopWatchingRatio = watchDevicePixelRatio(setDevicePixelRatio);
+    const syncDefaultSort = () => {
+      const prev = untrack(defaultSort);
+      const next = readDefaultLibrarySort();
+      setDefaultSort(next);
+      if (untrack(sort) === prev.sortBy && untrack(direction) === prev.direction) {
+        setSort(next.sortBy);
+        setDirection(next.direction);
+      }
+    };
     void boot();
     window.addEventListener('keydown', keyboard);
     window.addEventListener('focus', focusRefresh);
+    window.addEventListener('storage', syncDefaultSort);
+    window.addEventListener(DEFAULT_SORT_CHANGED_EVENT, syncDefaultSort);
     void registerAssetListener();
     onCleanup(() => {
       disposed = true;
@@ -2569,6 +2595,8 @@ export default function ManagementApp() {
       toolbarObserver?.disconnect();
       window.removeEventListener('keydown', keyboard);
       window.removeEventListener('focus', focusRefresh);
+      window.removeEventListener('storage', syncDefaultSort);
+      window.removeEventListener(DEFAULT_SORT_CHANGED_EVENT, syncDefaultSort);
       navigationMedia.removeEventListener('change', updateNavigationMode);
       stopWatchingRatio();
     });
@@ -2973,6 +3001,7 @@ export default function ManagementApp() {
                           onToggleDirection={() =>
                             setDirection(direction() === 'desc' ? 'asc' : 'desc')
                           }
+                          defaultSort={defaultSort()}
                           burstStacks={burstStacks()}
                           onBurstStacks={(on) => toggleBurstStacks(on)}
                           hideRejected={
@@ -2984,6 +3013,16 @@ export default function ManagementApp() {
                           onThumbSize={(value) => {
                             setThumbSize(value);
                             saveThumbSize(value);
+                          }}
+                          onReset={() => {
+                            const preferred = readDefaultLibrarySort();
+                            setDefaultSort(preferred);
+                            setSort(preferred.sortBy);
+                            setDirection(preferred.direction);
+                            toggleBurstStacks(false);
+                            if (flag() === 'not_reject') chooseFlag('any');
+                            setThumbSize(DEFAULT_THUMB_SIZE);
+                            saveThumbSize(DEFAULT_THUMB_SIZE);
                           }}
                         />
                       }

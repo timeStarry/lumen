@@ -1,18 +1,17 @@
 import { Show, createEffect, createSignal, onCleanup } from 'solid-js';
 import { Portal } from 'solid-js/web';
 import type { AssetListOptions } from '../model';
+import {
+  DEFAULT_THUMB_SIZE,
+  SORT_FIELD_OPTIONS,
+  type LibrarySortPreference,
+} from '../sort-preferences';
 import { Button, IconButton, Select, Slider, StatusDot, Switch } from '../ui';
 
 const VIEWPORT_GAP = 8;
 const POPOVER_WIDTH = 272;
 
-export const SORT_OPTIONS: { value: NonNullable<AssetListOptions['sort_by']>; label: string }[] = [
-  { value: 'captured_at', label: '拍摄时间' },
-  { value: 'created_at', label: '文件创建时间' },
-  { value: 'modified_at', label: '文件修改时间' },
-  { value: 'filename', label: '文件名' },
-  { value: 'rating', label: '评级' },
-];
+export const SORT_OPTIONS = SORT_FIELD_OPTIONS;
 
 export function sortSelectTitle(sort: NonNullable<AssetListOptions['sort_by']>): string | undefined {
   if (sort === 'captured_at') {
@@ -35,6 +34,7 @@ export default function LibraryViewOptions(props: {
   onSort: (value: NonNullable<AssetListOptions['sort_by']>) => void;
   direction: NonNullable<AssetListOptions['sort_direction']>;
   onToggleDirection: () => void;
+  defaultSort: LibrarySortPreference;
   burstStacks: boolean;
   onBurstStacks: (value: boolean) => void;
   hideRejected: boolean;
@@ -42,13 +42,19 @@ export default function LibraryViewOptions(props: {
   onHideRejected: (value: boolean) => void;
   thumbSize: number;
   onThumbSize: (value: number) => void;
+  onReset: () => void;
 }) {
   let anchorEl: HTMLSpanElement | undefined;
   let popoverEl: HTMLDivElement | undefined;
   const [open, setOpen] = createSignal(false);
   const [coords, setCoords] = createSignal({ left: VIEWPORT_GAP, top: VIEWPORT_GAP });
 
-  const customized = () => !props.burstStacks || props.hideRejected;
+  const customized = () =>
+    props.burstStacks ||
+    (props.hideRejected && !props.hideRejectedLocked) ||
+    props.sort !== props.defaultSort.sortBy ||
+    props.direction !== props.defaultSort.direction ||
+    props.thumbSize !== DEFAULT_THUMB_SIZE;
 
   function updateCoords() {
     const trigger = anchorEl?.querySelector<HTMLElement>('button');
@@ -233,6 +239,13 @@ export default function LibraryViewOptions(props: {
                 />
               </div>
             </div>
+            <Show when={customized()}>
+              <div class="library-view-section library-view-foot">
+                <Button size="sm" variant="ghost" icon="refresh" onClick={props.onReset}>
+                  重置视图
+                </Button>
+              </div>
+            </Show>
           </div>
         </Portal>
       </Show>

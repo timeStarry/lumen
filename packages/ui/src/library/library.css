@@ -304,6 +304,9 @@
   color: var(--nl-text-3);
   font-size: var(--nl-t-11);
 }
+.library-view-foot {
+  justify-items: end;
+}
 .library-sidebar {
   overflow-x: hidden;
 }
