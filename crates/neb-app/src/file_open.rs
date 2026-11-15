@@ -222,13 +222,15 @@ mod tests {
             base.iter().any(|ext| ext == "jpg")
                 && base.iter().any(|ext| ext == "dng")
                 && base.iter().any(|ext| ext == "cr3")
+                && base.iter().any(|ext| ext == "mp4")
+                && base.iter().any(|ext| ext == "mov")
         );
         for macos_only in ["heic", "heif", "avif"] {
             assert!(!base.iter().any(|ext| ext == macos_only));
         }
 
         let macos = collect_extensions(include_str!("../tauri.macos.conf.json"));
-        for modern in ["cr3", "heic", "heif", "avif"] {
+        for modern in ["cr3", "heic", "heif", "avif", "mp4", "mov"] {
             assert!(macos.iter().any(|ext| ext == modern));
         }
     }

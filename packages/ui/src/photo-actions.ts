@@ -12,7 +12,7 @@ export type OriginalFormatChoice = 'raw' | 'jpeg' | 'both';
 export interface OriginalExportTarget {
   id: string;
   filename: string;
-  kind: 'raw' | 'raster';
+  kind: 'raw' | 'raster' | 'video';
 }
 
 export interface OriginalExportPlan {
@@ -20,6 +20,7 @@ export interface OriginalExportPlan {
   pairedCount: number;
   rawTargets: OriginalExportTarget[];
   rasterTargets: OriginalExportTarget[];
+  videoTargets: OriginalExportTarget[];
   allTargets: OriginalExportTarget[];
   /** True when selection includes both RAW and JPEG/raster files (via RAW+JPEG pairs or mixed selection). */
   needsFormatChoice: boolean;
@@ -35,6 +36,7 @@ export async function resolveOriginalExportPlan(
 ): Promise<OriginalExportPlan> {
   const rawTargets: OriginalExportTarget[] = [];
   const rasterTargets: OriginalExportTarget[] = [];
+  const videoTargets: OriginalExportTarget[] = [];
   const allTargets: OriginalExportTarget[] = [];
   const seen = new Set<string>();
   let pairedCount = 0;
@@ -44,6 +46,7 @@ export async function resolveOriginalExportPlan(
     seen.add(target.id);
     allTargets.push(target);
     if (target.kind === 'raw') rawTargets.push(target);
+    else if (target.kind === 'video') videoTargets.push(target);
     else rasterTargets.push(target);
   };
 
@@ -75,6 +78,7 @@ export async function resolveOriginalExportPlan(
     pairedCount,
     rawTargets,
     rasterTargets,
+    videoTargets,
     allTargets,
     needsFormatChoice: rawTargets.length > 0 && rasterTargets.length > 0,
   };
@@ -84,8 +88,8 @@ export function targetsForOriginalChoice(
   plan: OriginalExportPlan,
   choice: OriginalFormatChoice,
 ): OriginalExportTarget[] {
-  if (choice === 'raw') return plan.rawTargets;
-  if (choice === 'jpeg') return plan.rasterTargets;
+  if (choice === 'raw') return [...plan.rawTargets, ...plan.videoTargets];
+  if (choice === 'jpeg') return [...plan.rasterTargets, ...plan.videoTargets];
   return plan.allTargets;
 }
 

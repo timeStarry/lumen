@@ -3174,6 +3174,7 @@ dependencies = [
  "image",
  "kamadak-exif",
  "libc",
+ "objc2",
  "objc2-foundation",
  "quick-xml 0.37.5",
  "rawler",

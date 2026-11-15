@@ -114,6 +114,131 @@ pub(crate) fn read_response(
     checked(response)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaSlice {
+    pub bytes: Vec<u8>,
+    pub start: u64,
+    pub end: u64,
+    pub total_len: u64,
+    pub partial: bool,
+}
+
+const MAX_MEDIA_SLICE_BYTES: u64 = 8 * 1024 * 1024;
+
+pub(crate) fn read_media_slice(
+    client: &Client,
+    config: &StorageConfig,
+    credentials: &Credentials,
+    key: &str,
+    start: u64,
+    end_inclusive: u64,
+) -> Result<MediaSlice> {
+    use reqwest::{
+        header::{ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, RANGE},
+        StatusCode,
+    };
+    let clamped_end = end_inclusive.min(start.saturating_add(MAX_MEDIA_SLICE_BYTES - 1));
+    let url = url_for(config, key)?;
+    let range_header = format!("bytes={start}-{clamped_end}");
+    let builder = if config.kind == "s3" {
+        s3_request(client, credentials, config, url, &[])?
+    } else {
+        dav_request(client, credentials, Method::GET, url)
+    };
+    let response = builder
+        .header(RANGE, range_header)
+        .header(ACCEPT_ENCODING, "identity")
+        .send()?;
+
+    if response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+        let total = response
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("bytes */"))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        bail!("E_RANGE_UNSATISFIABLE:{total}");
+    }
+
+    if response.status() == StatusCode::PARTIAL_CONTENT {
+        let cr = response
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .context("E_DECODE: Missing Content-Range on 206 media response")?;
+        let rest = cr
+            .strip_prefix("bytes ")
+            .context("E_DECODE: Invalid Content-Range unit")?;
+        let (span, total_str) = rest
+            .split_once('/')
+            .context("E_DECODE: Invalid Content-Range format")?;
+        let (s_str, e_str) = span
+            .split_once('-')
+            .context("E_DECODE: Invalid Content-Range span")?;
+        let actual_start: u64 = s_str.trim().parse()?;
+        let actual_end: u64 = e_str.trim().parse()?;
+        let total_len: u64 = total_str.trim().parse().unwrap_or(actual_end + 1);
+        if actual_end < actual_start
+            || actual_end - actual_start + 1 > MAX_MEDIA_SLICE_BYTES
+        {
+            bail!("E_LIMIT: Remote media slice exceeds bounded chunk limit");
+        }
+        let expected = (actual_end - actual_start + 1) as usize;
+        let mut bytes = Vec::with_capacity(expected);
+        response
+            .take((expected as u64) + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > expected {
+            bytes.truncate(expected);
+        }
+        let end = actual_start + (bytes.len().saturating_sub(1) as u64);
+        return Ok(MediaSlice {
+            bytes,
+            start: actual_start,
+            end,
+            total_len,
+            partial: true,
+        });
+    }
+
+    let response = checked(response)?;
+    let declared_len = response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if start == 0 && declared_len.is_some_and(|len| len <= MAX_MEDIA_SLICE_BYTES) {
+        let mut bytes = Vec::new();
+        response
+            .take(MAX_MEDIA_SLICE_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        let total = bytes.len() as u64;
+        if total <= MAX_MEDIA_SLICE_BYTES {
+            let slice_end = clamped_end.min(total.saturating_sub(1));
+            if total == 0 {
+                return Ok(MediaSlice {
+                    bytes,
+                    start: 0,
+                    end: 0,
+                    total_len: 0,
+                    partial: false,
+                });
+            }
+            let partial = slice_end + 1 < total;
+            bytes.truncate((slice_end + 1) as usize);
+            return Ok(MediaSlice {
+                bytes,
+                start: 0,
+                end: slice_end,
+                total_len: total,
+                partial,
+            });
+        }
+    }
+    bail!("E_UNSUPPORTED_CODEC: Remote storage server does not support HTTP byte-range media streaming")
+}
+
 pub fn browse(
     client: &Client,
     config: &StorageConfig,

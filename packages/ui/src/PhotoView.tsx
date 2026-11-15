@@ -281,15 +281,27 @@ export function Thumbnail(props: {
       <div class="thumbnail-image">
         <Show when={!shown()}>
           <div class="thumbnail-fallback">
-            <Icon name="photo" size={26} />
+            <Icon name={props.asset.kind === 'video' ? 'player-play' : 'photo'} size={26} />
             <span>
-              {previewLoading() ? '载入中' : props.asset.kind === 'raw' ? 'RAW' : '无预览'}
+              {previewLoading()
+                ? '载入中'
+                : props.asset.kind === 'video'
+                  ? '视频'
+                  : props.asset.kind === 'raw'
+                    ? 'RAW'
+                    : '无预览'}
             </span>
           </div>
         </Show>
         <For each={layers()}>{(layer) => layer.image}</For>
         <Show when={!props.tile}>
           <span class="filetype">{props.asset.extension.toUpperCase()}</span>
+        </Show>
+        <Show when={props.asset.kind === 'video'}>
+          <span class="video-badge" aria-label="视频片段">
+            <Icon name="player-play" size={11} />
+            <span>{props.asset.metadata?.Duration || props.asset.extension.toUpperCase()}</span>
+          </span>
         </Show>
         <Show when={props.asset.color_label && props.asset.color_label !== 'none'}>
           <span class="tile-color-dot" data-color={props.asset.color_label} aria-hidden="true" />

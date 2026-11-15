@@ -52,6 +52,14 @@ const groupFields: readonly { title: string; fields: readonly Field[] }[] = [
     ],
   },
   {
+    title: '视频',
+    fields: [
+      { label: '时长', aliases: ['Duration'] },
+      { label: '视频编码', aliases: ['Video Codec'] },
+      { label: '帧率', aliases: ['Frame Rate'] },
+    ],
+  },
+  {
     title: '其他',
     fields: [
       { label: '方向', aliases: ['Orientation'] },

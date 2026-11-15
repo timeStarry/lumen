@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS assets (
     path_key TEXT NOT NULL,
     filename TEXT NOT NULL,
     extension TEXT NOT NULL,
-    kind TEXT NOT NULL CHECK(kind IN ('raster','raw')),
+    kind TEXT NOT NULL CHECK(kind IN ('raster','raw','video')),
     size INTEGER NOT NULL,
     modified_at TEXT NOT NULL,
     modified_stamp TEXT NOT NULL,

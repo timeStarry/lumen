@@ -1,5 +1,7 @@
 import {
+  formatDurationSeconds,
   histogramFromPixels,
+  isVideoExtension,
   validCrop,
   type Asset,
   type Collection,
@@ -20,6 +22,8 @@ const assets = new Map<string, Asset>();
 const demoCollections = new Map<string, Collection>();
 const demoCollectionItems = new Map<string, Set<string>>();
 const previewCache = new Map<string, Promise<{ url: string; width: number; height: number }>>();
+const mediaUrlCache = new Map<string, string>();
+const videoPosterCache = new Map<string, HTMLCanvasElement>();
 const browserLibrary: Library = {
   id: 'browser',
   name: '临时图片库',
@@ -29,9 +33,106 @@ const browserLibrary: Library = {
 };
 let libraryVisible = true;
 
+function renderVideoSlateCanvas(width = 1280, height = 720): HTMLCanvasElement {
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, width);
+  canvas.height = Math.max(1, height);
+  const ctx = canvas.getContext('2d');
+  if (ctx) {
+    ctx.fillStyle = '#1e1f22';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    const radius = Math.max(16, Math.round(Math.min(canvas.width, canvas.height) * 0.1));
+    const cx = canvas.width / 2;
+    const cy = canvas.height / 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+    ctx.fillStyle = '#2d2f34';
+    ctx.fill();
+    ctx.strokeStyle = '#5c6068';
+    ctx.lineWidth = Math.max(1.5, radius * 0.06);
+    ctx.stroke();
+    ctx.beginPath();
+    const tri = radius * 0.42;
+    ctx.moveTo(cx - tri * 0.55, cy - tri * 0.72);
+    ctx.lineTo(cx - tri * 0.55, cy + tri * 0.72);
+    ctx.lineTo(cx + tri * 0.82, cy);
+    ctx.closePath();
+    ctx.fillStyle = '#dcdde0';
+    ctx.fill();
+  }
+  return canvas;
+}
+
+async function probeBrowserVideo(
+  file: File,
+): Promise<{ canvas: HTMLCanvasElement; width?: number; height?: number; duration?: number }> {
+  const url = URL.createObjectURL(file);
+  try {
+    return await new Promise((resolve) => {
+      const video = document.createElement('video');
+      video.preload = 'metadata';
+      video.muted = true;
+      video.playsInline = true;
+      let settled = false;
+      const finish = (
+        result: { canvas: HTMLCanvasElement; width?: number; height?: number; duration?: number },
+      ) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        video.removeAttribute('src');
+        video.load();
+        resolve(result);
+      };
+      const timer = setTimeout(() => finish({ canvas: renderVideoSlateCanvas() }), 900);
+      video.onerror = () => finish({ canvas: renderVideoSlateCanvas() });
+      video.onloadedmetadata = () => {
+        const w = video.videoWidth || undefined;
+        const h = video.videoHeight || undefined;
+        const dur = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : undefined;
+        if (!w || !h) {
+          finish({ canvas: renderVideoSlateCanvas(), duration: dur });
+          return;
+        }
+        video.onseeked = () => {
+          const canvas = document.createElement('canvas');
+          canvas.width = w;
+          canvas.height = h;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            try {
+              ctx.drawImage(video, 0, 0, w, h);
+              finish({ canvas, width: w, height: h, duration: dur });
+              return;
+            } catch {
+              /* Fall back to aspect-matched slate below. */
+            }
+          }
+          finish({ canvas: renderVideoSlateCanvas(w, h), width: w, height: h, duration: dur });
+        };
+        try {
+          video.currentTime = dur && dur > 0.2 ? Math.min(0.5, dur * 0.1) : 0;
+        } catch {
+          finish({ canvas: renderVideoSlateCanvas(w, h), width: w, height: h, duration: dur });
+        }
+      };
+      video.src = url;
+    });
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
 async function canvasFor(id: string): Promise<HTMLCanvasElement> {
+  const cachedPoster = videoPosterCache.get(id);
+  if (cachedPoster) return cachedPoster;
   const file = files.get(id);
   if (!file) throw new Error('此图片已不在浏览器会话中，请重新选择文件。');
+  if (assets.get(id)?.kind === 'video') {
+    const poster = renderVideoSlateCanvas(assets.get(id)?.width || 1280, assets.get(id)?.height || 720);
+    videoPosterCache.set(id, poster);
+    return poster;
+  }
   const url = URL.createObjectURL(file);
   try {
     const image = new Image();
@@ -81,15 +182,50 @@ export async function addBrowserFiles(
   libraryVisible = true;
   for (const file of selected) {
     const id = crypto.randomUUID();
+    const extension = file.name.split('.').pop()?.toLowerCase() || '';
+    const isVideo = isVideoExtension(extension) || file.type.startsWith('video/');
     files.set(id, file);
     try {
+      if (isVideo) {
+        const probed = await probeBrowserVideo(file);
+        videoPosterCache.set(id, probed.canvas);
+        const metadata: Record<string, string> = {
+          Format: (extension || 'video').toUpperCase(),
+          'Preview Source': 'video_poster',
+        };
+        if (probed.duration !== undefined) {
+          metadata.Duration = formatDurationSeconds(probed.duration);
+        }
+        assets.set(id, {
+          id,
+          library_id: 'browser',
+          path: file.name,
+          filename: file.name,
+          extension,
+          kind: 'video',
+          size: file.size,
+          created_at: '',
+          captured_at: localStamp(file.lastModified),
+          capture_status: 'available',
+          modified_at: new Date(file.lastModified).toISOString(),
+          width: probed.width,
+          height: probed.height,
+          rating: 0,
+          flag: 'none',
+          metadata,
+          availability: 'available',
+        });
+        added++;
+        addedIds.push(id);
+        continue;
+      }
       const canvas = await canvasFor(id);
       assets.set(id, {
         id,
         library_id: 'browser',
         path: file.name,
         filename: file.name,
-        extension: file.name.split('.').pop()?.toLowerCase() || '',
+        extension,
         kind: 'raster',
         size: file.size,
         created_at: '',
@@ -426,6 +562,7 @@ export async function demoCommand<T>(command: string, params: Record<string, unk
     }
     case 'asset.crop': {
       if (!asset) throw new Error('图片不存在。');
+      if (asset.kind === 'video') throw new Error('E_UNSUPPORTED: 视频文件不支持画面裁剪。');
       const crop = {
         x: Number(params.x),
         y: Number(params.y),
@@ -469,6 +606,8 @@ export async function demoCommand<T>(command: string, params: Record<string, unk
       break;
     }
     case 'asset.histogram': {
+      if (asset?.kind === 'video')
+        throw new Error('E_UNSUPPORTED: 视频文件无静态像素直方图。');
       const canvas = applyCrop(await canvasFor(String(params.id)), asset?.crop);
       result = {
         ...histogramFromPixels(
@@ -480,6 +619,8 @@ export async function demoCommand<T>(command: string, params: Record<string, unk
     }
     case 'asset.export': {
       if (!asset) throw new Error('图片不存在。');
+      if (asset.kind === 'video')
+        throw new Error('E_UNSUPPORTED: 视频文件不支持 JPEG 预设导出，请使用“导出原片”。');
       const cropped = applyCrop(await canvasFor(asset.id), asset.crop);
       let output = cropped;
       const maxEdge = typeof params.max_edge === 'number' ? params.max_edge : 0;
@@ -639,6 +780,19 @@ function retireDemoPreview(entry: Promise<{ url: string }>) {
 function clearDemoPreviews() {
   for (const entry of previewCache.values()) retireDemoPreview(entry);
   previewCache.clear();
+  for (const url of mediaUrlCache.values()) URL.revokeObjectURL(url);
+  mediaUrlCache.clear();
+  videoPosterCache.clear();
+}
+
+export function demoMediaUrl(id: string): string {
+  const existing = mediaUrlCache.get(id);
+  if (existing) return existing;
+  const file = files.get(id);
+  if (!file) throw new Error('此视频已不在浏览器会话中，请重新选择文件。');
+  const url = URL.createObjectURL(file);
+  mediaUrlCache.set(id, url);
+  return url;
 }
 function renderDemoPreview(
   id: string,

@@ -342,9 +342,10 @@ impl IndexContext {
                 return capture_time::read_path(lease.path());
             }
         }
-        // Known non-EXIF containers need no remote bytes.
+        // Known non-EXIF/non-video containers need no remote bytes.
         if !matches!(asset.extension.as_str(), "jpg" | "jpeg" | "tif" | "tiff")
             && asset.kind != "raw"
+            && asset.kind != "video"
         {
             return Ok(capture_time::CaptureTime {
                 captured_at: String::new(),
@@ -396,10 +397,24 @@ impl IndexContext {
                             || length >= asset.size,
                         "E_CONFLICT: Remote response ended before the scanned file size; scan the library before retrying"
                     );
+                    let prefix_cap = if asset.kind == "video" {
+                        256 * 1024
+                    } else {
+                        1024 * 1024
+                    };
                     match capture_time::read(&mut Cursor::new(prefix.as_slice()), length) {
                         Ok(capture) => return Ok(capture),
-                        Err(error) if prefix.len() == previous || prefix.len() >= 1024 * 1024 => {
-                            return Err(error)
+                        Err(error) if prefix.len() == previous || prefix.len() >= prefix_cap => {
+                            if asset.kind == "video" {
+                                // When a remote server lacks Range support and `moov` is at EOF,
+                                // record missing capture date cleanly instead of failing the job.
+                                return Ok(capture_time::CaptureTime {
+                                    captured_at: String::new(),
+                                    metadata: Default::default(),
+                                    status: capture_time::CaptureStatus::Missing,
+                                });
+                            }
+                            return Err(error);
                         }
                         Err(_) => {}
                     }

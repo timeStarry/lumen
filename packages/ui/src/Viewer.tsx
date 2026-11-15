@@ -29,6 +29,7 @@ import AssetInspector from './AssetInspector';
 import CompareStage from './CompareStage';
 import { fitCropToAspect, resolveAspectRatio, type AspectPreset } from './crop-aspect';
 import PhotoView, { decodedThumbnail, rememberDecodedPreview } from './PhotoView';
+import VideoStage from './VideoStage';
 import { prefetchViewerImage } from './viewer-frame-cache';
 import Icon from './Icon';
 import {
@@ -207,6 +208,7 @@ export default function Viewer(props: {
   );
   const history = createUndoHistory(200);
   const hud = createHud();
+  let toggleVideoPlay: (() => void) | undefined;
   let pulseTimer: ReturnType<typeof setTimeout> | undefined;
   let pendingAdvance: (() => void) | undefined;
   let container!: HTMLDivElement;
@@ -279,7 +281,7 @@ export default function Viewer(props: {
   );
   const focusKey = createMemo(() => {
     const current = asset();
-    return !refreshing() && current?.id === id() && current
+    return !refreshing() && current?.id === id() && current && current.kind !== 'video'
       ? JSON.stringify({
           id: current.id,
           path: current.path,
@@ -325,6 +327,7 @@ export default function Viewer(props: {
   });
   const focusUnavailableReason = createMemo(() => {
     if (!asset() || asset()?.id !== id() || loading()) return '正在读取影像…';
+    if (asset()?.kind === 'video') return '视频文件无静态相机对焦点';
     if (cropMode()) return '裁剪时暂不显示对焦点';
     if (refreshing() || focusLoading()) return '正在检测对焦信息…';
     if (focusError()) return `对焦信息读取失败：${focusError()}`;
@@ -525,7 +528,7 @@ export default function Viewer(props: {
           label: '导出 JPEG…',
           icon: 'export',
           shortcut: '⌘⇧E',
-          disabled: !target || !!busy() || cropMode(),
+          disabled: !target || target.kind === 'video' || !!busy() || cropMode(),
           onSelect: () => target && setExportTargets([target.id]),
         },
         ...(desktop && local
@@ -950,6 +953,10 @@ export default function Viewer(props: {
   function toggleRawMode(fromKeyboard = false) {
     const target = asset();
     if (!target || cropMode()) return;
+    if (target.kind === 'video') {
+      if (fromKeyboard) hud.show('当前为视频文件，已使用流式播放', 'player-play');
+      return;
+    }
     if (target.kind !== 'raw') {
       if (fromKeyboard) hud.show('当前为光栅图像，已使用原图解码', 'photo');
       return;
@@ -964,7 +971,13 @@ export default function Viewer(props: {
     activity();
   }
   function cullKeyboard(event: KeyboardEvent): boolean {
+    if (event.target instanceof HTMLVideoElement) return false;
     if (event.key === ' ' && (isControl(document.activeElement) || event.repeat)) return false;
+    if (event.key === ' ' && asset()?.kind === 'video' && !compareIds().length && toggleVideoPlay) {
+      event.preventDefault();
+      toggleVideoPlay();
+      return true;
+    }
     const action = cullKeyAction(event);
     if (!action) return false;
     event.preventDefault();
@@ -1052,7 +1065,8 @@ export default function Viewer(props: {
       !isTextEntry(event.target)
     ) {
       event.preventDefault();
-      if (asset() && !cropMode() && !busy()) setExportTargets([asset()!.id]);
+      if (asset() && asset()!.kind !== 'video' && !cropMode() && !busy())
+        setExportTargets([asset()!.id]);
       return;
     }
     if (editingOverlay()) {
@@ -1170,8 +1184,10 @@ export default function Viewer(props: {
       !cropMode() &&
       !isControl(document.activeElement)
     ) {
+      if (event.target instanceof HTMLVideoElement) return;
       event.preventDefault();
-      void escape();
+      if (asset()?.kind === 'video' && toggleVideoPlay) toggleVideoPlay();
+      else void escape();
     } else if (key === 'escape') {
       event.preventDefault();
       void escape();
@@ -1491,7 +1507,7 @@ export default function Viewer(props: {
     if (ratio) setCrop((prev) => fitCropToAspect(prev, ratio, dims.width, dims.height));
   }
   function beginCrop() {
-    if (!asset() || busy()) return;
+    if (!asset() || asset()!.kind === 'video' || busy()) return;
     setCrop({ ...(asset()!.crop || fullCrop) });
     setCropPreset('free');
     setCropSwapped(false);
@@ -1734,10 +1750,16 @@ export default function Viewer(props: {
             <IconButton
               size="sm"
               icon="crop"
-              label={cropMode() ? '退出裁剪' : '裁剪（C）'}
-              shortcut="C"
+              label={
+                asset()?.kind === 'video'
+                  ? '视频不支持裁剪'
+                  : cropMode()
+                    ? '退出裁剪'
+                    : '裁剪（C）'
+              }
+              shortcut={asset()?.kind === 'video' ? undefined : 'C'}
               pressed={cropMode()}
-              disabled={!asset() || !!busy() || mode() === 'cull'}
+              disabled={!asset() || asset()?.kind === 'video' || !!busy() || mode() === 'cull'}
               onClick={() => (cropMode() ? setCropMode(false) : beginCrop())}
             />
             <IconButton
@@ -1903,64 +1925,112 @@ export default function Viewer(props: {
             }
           >
             {(current) => (
-              <PhotoView
-                asset={current()}
-                cropMode={cropMode()}
-                crop={crop()}
-                setCrop={setCrop}
-                onPrevious={() => move(-1)}
-                onNext={() => move(1)}
-                hasPrevious={!busy() && !cropMode() && index() > 0}
-                hasNext={!busy() && !cropMode() && index() < ids().length - 1}
-                focusEnabled={focusVisible()}
-                focusRegions={focus().regions}
-                zoomToggle={zoomToggle()}
-                fill={false}
-                preferRaw={preferRaw()}
-                onTogglePreferRaw={
-                  rawUnavailable(current()) ? undefined : () => toggleRawMode(false)
+              <Show
+                when={current().kind !== 'video'}
+                fallback={
+                  <VideoStage
+                    asset={current()}
+                    hasPrevious={!busy() && index() > 0}
+                    hasNext={!busy() && index() < ids().length - 1}
+                    onPrevious={() => move(-1)}
+                    onNext={() => move(1)}
+                    registerTogglePlay={(fn) => {
+                      toggleVideoPlay = fn;
+                    }}
+                    onOpenExternal={
+                      desktop && !current().source_key && current().path
+                        ? () =>
+                            void openExternal({ id: current().id, path: current().path }).catch(
+                              (e) => setError(errorMessage(e)),
+                            )
+                        : undefined
+                    }
+                    onInspected={(inspected) => {
+                      if (inspected.id !== current().id) return;
+                      const enriched: Asset = {
+                        ...current(),
+                        width: inspected.width,
+                        height: inspected.height,
+                        metadata: inspected.metadata,
+                        availability: inspected.availability,
+                        cache_pinned: inspected.cache_pinned,
+                      };
+                      remember([enriched]);
+                      setAsset((previous) =>
+                        previous && previous.id === inspected.id
+                          ? {
+                              ...previous,
+                              width: inspected.width,
+                              height: inspected.height,
+                              metadata: inspected.metadata,
+                              availability: inspected.availability,
+                              cache_pinned: inspected.cache_pinned,
+                            }
+                          : previous,
+                      );
+                    }}
+                  />
                 }
-                clippingEnabled={clippingEnabled()}
-                onToggleClipping={() => toggleClipping(false)}
-                cropAspect={cropAspect()}
-                onPreviewStateChange={(state) => {
-                  if (current().id !== id() || state.key !== currentPreviewKey()) return;
-                  setPreviewKey(state.key);
-                  setPreviewPending(state.loading);
-                  setPreviewFailed(state.failed);
-                  setPreviewMapping(state.loading || state.failed ? undefined : state.mapping);
-                  if (
-                    !state.loading &&
-                    !state.failed &&
-                    state.asset?.id === current().id &&
-                    (state.asset.metadata !== current().metadata ||
-                      state.asset.width !== current().width ||
-                      state.asset.height !== current().height)
-                  ) {
-                    const inspected = state.asset;
-                    const enriched: Asset = {
-                      ...current(),
-                      width: inspected.width,
-                      height: inspected.height,
-                      metadata: inspected.metadata,
-                      availability: inspected.availability,
-                      cache_pinned: inspected.cache_pinned,
-                    };
-                    remember([enriched]);
-                    setAsset(
-                      (previous) =>
-                        previous && {
-                          ...previous,
-                          width: inspected.width,
-                          height: inspected.height,
-                          metadata: inspected.metadata,
-                          availability: inspected.availability,
-                          cache_pinned: inspected.cache_pinned,
-                        },
-                    );
+              >
+                <PhotoView
+                  asset={current()}
+                  cropMode={cropMode()}
+                  crop={crop()}
+                  setCrop={setCrop}
+                  onPrevious={() => move(-1)}
+                  onNext={() => move(1)}
+                  hasPrevious={!busy() && !cropMode() && index() > 0}
+                  hasNext={!busy() && !cropMode() && index() < ids().length - 1}
+                  focusEnabled={focusVisible()}
+                  focusRegions={focus().regions}
+                  zoomToggle={zoomToggle()}
+                  fill={false}
+                  preferRaw={preferRaw()}
+                  onTogglePreferRaw={
+                    rawUnavailable(current()) ? undefined : () => toggleRawMode(false)
                   }
-                }}
-              />
+                  clippingEnabled={clippingEnabled()}
+                  onToggleClipping={() => toggleClipping(false)}
+                  cropAspect={cropAspect()}
+                  onPreviewStateChange={(state) => {
+                    if (current().id !== id() || state.key !== currentPreviewKey()) return;
+                    setPreviewKey(state.key);
+                    setPreviewPending(state.loading);
+                    setPreviewFailed(state.failed);
+                    setPreviewMapping(state.loading || state.failed ? undefined : state.mapping);
+                    if (
+                      !state.loading &&
+                      !state.failed &&
+                      state.asset?.id === current().id &&
+                      (state.asset.metadata !== current().metadata ||
+                        state.asset.width !== current().width ||
+                        state.asset.height !== current().height)
+                    ) {
+                      const inspected = state.asset;
+                      const enriched: Asset = {
+                        ...current(),
+                        width: inspected.width,
+                        height: inspected.height,
+                        metadata: inspected.metadata,
+                        availability: inspected.availability,
+                        cache_pinned: inspected.cache_pinned,
+                      };
+                      remember([enriched]);
+                      setAsset(
+                        (previous) =>
+                          previous && {
+                            ...previous,
+                            width: inspected.width,
+                            height: inspected.height,
+                            metadata: inspected.metadata,
+                            availability: inspected.availability,
+                            cache_pinned: inspected.cache_pinned,
+                          },
+                      );
+                    }
+                  }}
+                />
+              </Show>
             )}
           </Show>
         </Show>

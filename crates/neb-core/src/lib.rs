@@ -15,11 +15,14 @@ mod ingest_records;
 mod jpeg_range;
 #[cfg(target_os = "macos")]
 mod macos_imageio;
+#[cfg(target_os = "macos")]
+mod macos_video;
 mod model;
 mod nikon_raw;
 pub mod preview;
 pub mod recycle;
 mod remote_exif;
+pub mod video;
 pub mod xmp;
 
 pub use cache::{CacheLease, CacheManager, Reservation};
@@ -27,9 +30,9 @@ pub use catalog::Core;
 pub use focus_points::read_from as remote_focus;
 pub use focus_points::{FocusInfo, FocusRegion};
 pub use imaging::{
-    downsample_preview, export_original_file, export_original_from_reader, histogram_from_jpeg,
-    remote_preview, remote_preview_bundle, stream_preview_from_bytes, ExportColorSpace,
-    ExportOptions,
+    downsample_preview, export_original_file, export_original_from_reader, fallback_video_slate,
+    histogram_from_jpeg, remote_preview, remote_preview_bundle, stream_preview_from_bytes,
+    ExportColorSpace, ExportOptions,
 };
 pub use ingest_records::{Card, CardIdentity, ImportBatch, ImportPreset};
 pub use model::{Asset, Collection, Crop, Library, Location};
@@ -92,6 +95,11 @@ pub fn capabilities() -> serde_json::Value {
             "max_edge_range": [256, 16384]
         },
         "color_management": "ICC profile passthrough + EXIF Adobe RGB (1998) ICC synthesis + linear-light sRGB / Display P3 / Adobe RGB export conversion",
+        "video": {
+            "formats": video::VIDEO_EXTENSIONS,
+            "playback": "byte_range_webview_streaming_with_external_player_fallback",
+            "poster": if cfg!(target_os = "macos") { "macos_avfoundation_with_slate_fallback" } else { "aspect_matched_slate_poster" }
+        },
         "max_file_bytes": imaging::MAX_FILE_BYTES,
         "max_pixels": imaging::MAX_PIXELS
     })

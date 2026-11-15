@@ -286,6 +286,11 @@ export default function ComparePane(props: {
       </Show>
       <div class="compare-pane-badge">
         <span class="compare-pane-name">{props.asset.filename}</span>
+        <Show when={props.asset.kind === 'video'}>
+          <span class="compare-pane-tier">
+            {props.asset.metadata?.Duration || props.asset.extension.toUpperCase()}
+          </span>
+        </Show>
         <Show when={fullImage()?.key === requestKey()}>
           <span class="compare-pane-tier">1:1</span>
         </Show>

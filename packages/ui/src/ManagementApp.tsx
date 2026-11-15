@@ -716,6 +716,12 @@ export default function ManagementApp() {
     reject: '淘汰',
     not_reject: '隐藏淘汰',
   };
+  const FORMAT_LABELS: Record<string, string> = {
+    photo: '仅照片',
+    video: '视频',
+    raw: 'RAW',
+    jpeg: 'JPEG',
+  };
   /** Active filters as removable chips, so a closed panel never hides what is applied. */
   const activeFilters = createMemo(() => {
     const chips: { label: string; clear: () => void }[] = [];
@@ -729,7 +735,10 @@ export default function ManagementApp() {
         clear: () => setColorLabel('any'),
       });
     if (format() !== 'all')
-      chips.push({ label: format().toUpperCase(), clear: () => setFormat('all') });
+      chips.push({
+        label: FORMAT_LABELS[format()] || format().toUpperCase(),
+        clear: () => setFormat('all'),
+      });
     if (camera()) chips.push({ label: camera(), clear: () => setCamera('') });
     if (lens()) chips.push({ label: lens(), clear: () => setLens('') });
     if (keyword())
@@ -2173,7 +2182,7 @@ export default function ManagementApp() {
           label: count > 1 ? `导出所选 ${count} 张为 JPEG…` : '导出 JPEG…',
           icon: 'export',
           shortcut: '⌘⇧E',
-          disabled: tasks.isRunning('export'),
+          disabled: tasks.isRunning('export') || (count === 1 && asset.kind === 'video'),
           onSelect: () => setExportDialogIds([...selectedIds()]),
         },
         ...(localSingle || (count === 1 && !!asset.path)
@@ -2672,7 +2681,7 @@ export default function ManagementApp() {
         ref={fileInput}
         class="visually-hidden"
         type="file"
-        accept="image/*,.dng,.cr2,.nef,.arw,.raf,.orf,.rw2"
+        accept="image/*,video/*,.dng,.cr2,.cr3,.nef,.arw,.raf,.orf,.rw2,.mkv,.mts,.m2ts"
         multiple
         aria-label="选择浏览器演示图片"
         onChange={importBrowser}

@@ -159,7 +159,11 @@ export function browserAssetList(
       ? item.kind === 'raw'
       : options.format === 'jpeg'
         ? jpeg(item)
-        : true);
+        : options.format === 'video'
+          ? item.kind === 'video'
+          : options.format === 'photo'
+            ? item.kind !== 'video'
+            : true);
   const eligible = inLibrary.filter(matches);
   const groups = new Map<string, Asset[]>();
   if (paired)

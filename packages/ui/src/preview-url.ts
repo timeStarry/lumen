@@ -1,5 +1,5 @@
 import { convertFileSrc, isTauri } from '@tauri-apps/api/core';
-import { demoPreviewUrl } from './demo';
+import { demoMediaUrl, demoPreviewUrl } from './demo';
 import { TIER_PIXELS, type Asset, type PreviewTier } from './model';
 
 export { TIER_PIXELS, type PreviewTier };
@@ -31,6 +31,15 @@ export function previewUrl(
     `${asset.id}/${tier}/${uncropped ? 1 : 0}/${revision}${preferRaw ? '/raw' : ''}`,
     'neb',
   );
+}
+/**
+ * Desktop: byte-range media stream (`206 Partial Content`) served by `neb://localhost/media/<id>/<rev>`.
+ * Browser demo: object URL for the local File blob.
+ */
+export function mediaUrl(asset: Pick<Asset, 'id' | 'preview_revision'>): string | Promise<string> {
+  const revision = asset.preview_revision || 0;
+  if (!isTauri()) return demoMediaUrl(asset.id);
+  return convertFileSrc(`media/${asset.id}/${revision}`, 'neb');
 }
 /**
  * Fetches and decodes an image into the element that will be displayed, so each image costs

@@ -143,7 +143,7 @@ impl Core {
         );
         let format = args.format.as_deref().unwrap_or("all");
         ensure!(
-            ["all", "raw", "jpeg"].contains(&format),
+            ["all", "photo", "raw", "jpeg", "video"].contains(&format),
             "E_INVALID: Unknown image format filter"
         );
         let sort = match args.sort_by.as_deref().unwrap_or("captured_at") {
@@ -225,8 +225,10 @@ impl Core {
             where_params.push(V::Text(like_pattern));
         }
         match format {
+            "photo" => clauses.push("kind<>'video'".to_owned()),
             "raw" => clauses.push("kind='raw'".to_owned()),
             "jpeg" => clauses.push("lower(extension) IN ('jpg','jpeg')".to_owned()),
+            "video" => clauses.push("kind='video'".to_owned()),
             _ => {}
         }
         match flag {

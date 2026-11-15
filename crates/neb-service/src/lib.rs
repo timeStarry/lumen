@@ -23,6 +23,7 @@ pub use pregenerate::PregenerateReport;
 mod cards;
 mod fingerprint;
 mod remote_cache;
+pub use remote_cache::{ByteRangeSpec, MediaChunk};
 
 const PREVIEW_MEMORY_ENTRIES: usize = 1024;
 const PREVIEW_MEMORY_BYTES: usize = 192 * 1024 * 1024;
@@ -173,6 +174,7 @@ impl From<anyhow::Error> for CommandError {
             "E_LIMIT",
             "E_DOWNLOAD_REQUIRED",
             // Longer codes first: matching is by prefix.
+            "E_RANGE_UNSATISFIABLE",
             "E_UNSUPPORTED_CODEC",
             "E_UNSUPPORTED",
             "E_NOT_FOUND",
@@ -1450,7 +1452,7 @@ impl Service {
 
 struct BoundedImageReader {
     inner: Box<dyn Read>,
-    remaining: usize,
+    remaining: u64,
 }
 impl Read for BoundedImageReader {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
@@ -1464,13 +1466,15 @@ impl Read for BoundedImageReader {
             } else {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "E_LIMIT: Remote image exceeds the 512 MiB limit",
+                    "E_LIMIT: Remote media exceeds the download limit",
                 ))
             };
         }
-        let limit = buffer.len().min(self.remaining);
+        let limit = u64::try_from(buffer.len())
+            .unwrap_or(u64::MAX)
+            .min(self.remaining) as usize;
         let read = self.inner.read(&mut buffer[..limit])?;
-        self.remaining -= read;
+        self.remaining -= read as u64;
         Ok(read)
     }
 }

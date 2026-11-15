@@ -394,13 +394,34 @@ fn decode_source(
             }
         };
 
-    let width = unsafe { CGImageGetWidth(cg_image.as_ptr()) };
-    let height = unsafe { CGImageGetHeight(cg_image.as_ptr()) };
+    let (dynamic, icc) = cg_image_ref_to_dynamic(cg_image.as_ptr())?;
+    let mut dynamic = dynamic;
+    if !already_oriented {
+        dynamic.apply_orientation(
+            Orientation::from_exif(orientation).unwrap_or(Orientation::NoTransforms),
+        );
+    }
+    Ok((dynamic, orientation, icc))
+}
+
+/// Converts a `+1` retained `CGImageRef` into an RGB `DynamicImage` plus its
+/// source ICC profile (if RGB), releasing `cg_image_retained` on return.
+pub(crate) fn cg_image_to_dynamic_owned(
+    cg_image_retained: *const c_void,
+) -> Result<(DynamicImage, Option<Vec<u8>>)> {
+    let guard = CfGuard::new(cg_image_retained)
+        .context("E_UNSUPPORTED_CODEC: CoreGraphics returned a null image")?;
+    cg_image_ref_to_dynamic(guard.as_ptr())
+}
+
+fn cg_image_ref_to_dynamic(cg_image: CGImageRef) -> Result<(DynamicImage, Option<Vec<u8>>)> {
+    let width = unsafe { CGImageGetWidth(cg_image) };
+    let height = unsafe { CGImageGetHeight(cg_image) };
     if width == 0 || height == 0 || (width as u64) * (height as u64) > MAX_PIXELS {
         bail!("E_LIMIT: Decoded image dimensions are invalid or exceed 120 MP");
     }
 
-    let img_space = unsafe { CGImageGetColorSpace(cg_image.as_ptr()) };
+    let img_space = unsafe { CGImageGetColorSpace(cg_image) };
     let is_rgb = !img_space.is_null()
         && unsafe { CGColorSpaceGetModel(img_space) } == K_CG_COLOR_SPACE_MODEL_RGB;
     let fallback_space = if is_rgb {
@@ -460,7 +481,7 @@ fn decode_source(
                     height: height as f64,
                 },
             },
-            cg_image.as_ptr(),
+            cg_image,
         );
     }
 
@@ -472,13 +493,7 @@ fn decode_source(
     }
     let rgb_img = RgbImage::from_raw(width as u32, height as u32, rgb)
         .context("E_DECODE: Invalid RGB buffer dimensions")?;
-    let mut dynamic = DynamicImage::ImageRgb8(rgb_img);
-    if !already_oriented {
-        dynamic.apply_orientation(
-            Orientation::from_exif(orientation).unwrap_or(Orientation::NoTransforms),
-        );
-    }
-    Ok((dynamic, orientation, icc))
+    Ok((DynamicImage::ImageRgb8(rgb_img), icc))
 }
 
 #[cfg(test)]
