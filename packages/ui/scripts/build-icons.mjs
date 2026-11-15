@@ -26,6 +26,7 @@ const aliases = {
 };
 
 const tabler = [
+  'adjustments-horizontal',
   'alert-circle',
   'alert-triangle',
   'app-window',

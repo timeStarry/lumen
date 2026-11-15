@@ -47,11 +47,20 @@ export default function TaskPill(props: { tasks: TaskCenter }) {
       if (popoverEl && event.target instanceof Node && popoverEl.contains(event.target)) return;
       setOpen(false);
     };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setOpen(false);
+        trigger?.focus({ preventScroll: true });
+      }
+    };
     window.addEventListener('resize', onResize);
     window.addEventListener('scroll', onScroll, true);
+    window.addEventListener('keydown', onKeyDown);
     onCleanup(() => {
       window.removeEventListener('resize', onResize);
       window.removeEventListener('scroll', onScroll, true);
+      window.removeEventListener('keydown', onKeyDown);
     });
   });
 
@@ -169,6 +178,16 @@ export default function TaskPill(props: { tasks: TaskCenter }) {
                           </Show>
                         </span>
                         <span class="task-pill-row-title">{task.title}</span>
+                        <Show when={task.status === 'running' && task.onCancel}>
+                          <IconButton
+                            size="xs"
+                            icon="close"
+                            tipAlign="end"
+                            disabled={task.cancelling}
+                            label={task.cancelLabel || `停止 ${task.title}`}
+                            onClick={() => task.onCancel?.()}
+                          />
+                        </Show>
                         <Show when={task.status !== 'running'}>
                           <IconButton
                             size="xs"
@@ -186,7 +205,7 @@ export default function TaskPill(props: { tasks: TaskCenter }) {
                               ? (task.processed ?? 0) / Math.max(1, task.total)
                               : undefined
                           }
-                          label={task.title}
+                          label={task.progressLabel || task.title}
                         />
                       </Show>
                       <Show when={task.error || task.detail}>
