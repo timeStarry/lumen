@@ -23,17 +23,40 @@ test('default library sort preference and video format filtering & stage', async
     .getByRole('button', { name: '图片库', exact: true })
     .click();
 
-  const pngBase64 = await page.evaluate(() => {
+  const { pngBase64, webmBase64 } = await page.evaluate(async () => {
     const canvas = document.createElement('canvas');
-    canvas.width = 640;
-    canvas.height = 480;
+    canvas.width = 320;
+    canvas.height = 240;
     const ctx = canvas.getContext('2d')!;
     ctx.fillStyle = '#4c78a8';
-    ctx.fillRect(0, 0, 640, 480);
-    return canvas.toDataURL('image/png').split(',')[1];
+    ctx.fillRect(0, 0, 320, 240);
+    const png = canvas.toDataURL('image/png').split(',')[1];
+
+    const stream = canvas.captureStream(15);
+    const recorder = new MediaRecorder(stream, { mimeType: 'video/webm' });
+    const chunks: BlobPart[] = [];
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0) chunks.push(e.data);
+    };
+    const stopped = new Promise<void>((resolve) => {
+      recorder.onstop = () => resolve();
+    });
+    recorder.start();
+    ctx.fillStyle = '#e07a5f';
+    ctx.fillRect(40, 40, 240, 160);
+    await new Promise((r) => setTimeout(r, 120));
+    recorder.stop();
+    stream.getTracks().forEach((t) => t.stop());
+    await stopped;
+
+    const blob = new Blob(chunks, { type: 'video/webm' });
+    const buf = new Uint8Array(await blob.arrayBuffer());
+    let binary = '';
+    for (let i = 0; i < buf.length; i++) binary += String.fromCharCode(buf[i]);
+    return { pngBase64: png, webmBase64: btoa(binary) };
   });
 
-  // Load two photos (`zulu.png`, `alpha.png`) plus one `.mp4` video clip.
+  // Load two photos (`zulu.png`, `alpha.png`) plus one playable `.webm` video clip.
   await page.getByLabel('选择浏览器演示图片').setInputFiles([
     {
       name: 'zulu.png',
@@ -46,17 +69,17 @@ test('default library sort preference and video format filtering & stage', async
       buffer: Buffer.from(pngBase64, 'base64'),
     },
     {
-      name: 'clip-mid.mp4',
-      mimeType: 'video/mp4',
-      buffer: Buffer.from('00000014667479706d703432000000006d703432', 'hex'),
+      name: 'clip-mid.webm',
+      mimeType: 'video/webm',
+      buffer: Buffer.from(webmBase64, 'base64'),
     },
   ]);
 
   const tiles = page.locator('button.thumbnail.tile');
   await expect(tiles).toHaveCount(3);
-  // Alphabetical ascending: alpha.png -> clip-mid.mp4 -> zulu.png
+  // Alphabetical ascending: alpha.png -> clip-mid.webm -> zulu.png
   await expect(tiles.nth(0)).toHaveAttribute('aria-label', /alpha\.png/);
-  await expect(tiles.nth(1)).toHaveAttribute('aria-label', /clip-mid\.mp4/);
+  await expect(tiles.nth(1)).toHaveAttribute('aria-label', /clip-mid\.webm/);
   await expect(tiles.nth(2)).toHaveAttribute('aria-label', /zulu\.png/);
 
   // Video tile displays the video badge.
@@ -80,19 +103,43 @@ test('default library sort preference and video format filtering & stage', async
 
   await selectChoice(filterGroup.getByLabel('文件格式筛选'), 'video');
   await expect(tiles).toHaveCount(1);
-  await expect(tiles.nth(0)).toHaveAttribute('aria-label', /clip-mid\.mp4/);
+  await expect(tiles.nth(0)).toHaveAttribute('aria-label', /clip-mid\.webm/);
 
   await selectChoice(filterGroup.getByLabel('文件格式筛选'), 'photo');
   await expect(tiles).toHaveCount(2);
-  await expect(page.getByRole('button', { name: /clip-mid\.mp4/ })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: /clip-mid\.webm/ })).toHaveCount(0);
 
   await filterGroup.getByRole('button', { name: '清除全部' }).click();
   await expect(tiles).toHaveCount(3);
 
-  // 3. Double-click the video tile to open the inline video stage in Viewer overlay, verify clearance & no histogram, and mark it (`P`).
-  await page.getByRole('button', { name: /clip-mid\.mp4/ }).dblclick();
+  // 3. Open photo first, then step right (`→`) to video: verify custom darkroom controls & zero corner jump.
+  await page.getByRole('button', { name: /alpha\.png/ }).dblclick();
+  await expect(page.locator('.viewer-overlay .photo-stage')).toBeVisible();
+  const photoTlTop = await page
+    .locator('.viewer-overlay .nl-overlay-corner--tl')
+    .evaluate((el) => parseFloat(getComputedStyle(el).top));
+
+  await page.keyboard.press('ArrowRight');
   await expect(page.locator('.viewer-overlay .video-stage')).toBeVisible();
   await expect(page.locator('.viewer-overlay .nl-widget-hist')).toHaveCount(0);
+
+  const videoEl = page.locator('.viewer-overlay video.video-stage-player');
+  await expect(videoEl).toBeVisible();
+  await expect(videoEl).not.toHaveAttribute('controls');
+
+  const videoBar = page.locator('.viewer-overlay').getByRole('region', { name: '视频播放控制' });
+  await expect(videoBar).toBeVisible();
+  await expect(videoBar.getByRole('button', { name: /播放倍速：当前 1 倍/ })).toBeVisible();
+  await videoBar.getByRole('button', { name: /播放倍速：当前 1 倍/ }).click();
+  await expect(videoBar.getByRole('button', { name: /播放倍速：当前 1\.5 倍/ })).toBeVisible();
+
+  await page.keyboard.press('m');
+  await expect(videoBar.getByRole('button', { name: /取消静音（M）/ })).toBeVisible();
+
+  const videoTlTop = await page
+    .locator('.viewer-overlay .nl-overlay-corner--tl')
+    .evaluate((el) => parseFloat(getComputedStyle(el).top));
+  expect(videoTlTop).toBe(photoTlTop);
 
   const barBox = await page.locator('.viewer-overlay .nl-viewer-bar').boundingBox();
   const stagePaddingTop = await page
@@ -103,7 +150,7 @@ test('default library sort preference and video format filtering & stage', async
 
   await page.keyboard.press('p');
   await page.keyboard.press('Escape');
-  await expect(page.getByRole('button', { name: /clip-mid\.mp4.*留用/ })).toBeVisible();
+  await expect(page.getByRole('button', { name: /clip-mid\.webm.*留用/ })).toBeVisible();
 
   expect(errors).toEqual([]);
 });

@@ -209,6 +209,7 @@ export default function Viewer(props: {
   const history = createUndoHistory(200);
   const hud = createHud();
   let toggleVideoPlay: (() => void) | undefined;
+  let toggleVideoMute: (() => void) | undefined;
   let pulseTimer: ReturnType<typeof setTimeout> | undefined;
   let pendingAdvance: (() => void) | undefined;
   let container!: HTMLDivElement;
@@ -364,7 +365,7 @@ export default function Viewer(props: {
     return (
       target instanceof HTMLElement &&
       !!target.closest(
-        '.viewer-chrome, .viewer-controls, .compare-bar, .viewer-nav, .asset-inspector, .video-stage-fallback',
+        '.viewer-chrome, .viewer-controls, .nl-video-bar, .compare-bar, .viewer-nav, .asset-inspector, .video-stage-fallback',
       )
     );
   }
@@ -978,7 +979,27 @@ export default function Viewer(props: {
   }
   function cullKeyboard(event: KeyboardEvent): boolean {
     if (event.key === ' ' && event.target instanceof HTMLVideoElement) return true;
-    if (event.key === ' ' && (isControl(document.activeElement) || event.repeat)) return false;
+    if (
+      event.key.toLowerCase() === 'm' &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      !event.repeat &&
+      asset()?.kind === 'video' &&
+      !compareIds().length &&
+      toggleVideoMute
+    ) {
+      event.preventDefault();
+      toggleVideoMute();
+      return true;
+    }
+    if (
+      event.key === ' ' &&
+      ((isControl(document.activeElement) &&
+        !(asset()?.kind === 'video' && document.activeElement instanceof HTMLInputElement)) ||
+        event.repeat)
+    )
+      return false;
     if (event.key === ' ' && asset()?.kind === 'video' && !compareIds().length && toggleVideoPlay) {
       event.preventDefault();
       toggleVideoPlay();
@@ -1184,11 +1205,22 @@ export default function Viewer(props: {
       event.preventDefault();
       toggleRawMode(true);
     } else if (
+      key === 'm' &&
+      !event.shiftKey &&
+      !event.repeat &&
+      !cropMode() &&
+      asset()?.kind === 'video' &&
+      toggleVideoMute
+    ) {
+      event.preventDefault();
+      toggleVideoMute();
+    } else if (
       event.key === ' ' &&
       !event.shiftKey &&
       !event.repeat &&
       !cropMode() &&
-      !isControl(document.activeElement)
+      (!isControl(document.activeElement) ||
+        (asset()?.kind === 'video' && document.activeElement instanceof HTMLInputElement))
     ) {
       if (event.target instanceof HTMLVideoElement) return;
       event.preventDefault();
@@ -1946,6 +1978,9 @@ export default function Viewer(props: {
                     onNext={() => move(1)}
                     registerTogglePlay={(fn) => {
                       toggleVideoPlay = fn;
+                    }}
+                    registerToggleMute={(fn) => {
+                      toggleVideoMute = fn;
                     }}
                     onOpenExternal={
                       desktop && !current().source_key && current().path

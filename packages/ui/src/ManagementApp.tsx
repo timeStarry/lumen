@@ -1906,6 +1906,7 @@ export default function ManagementApp() {
       const library = libs[0];
       if (library) enterLibrary(library);
       const listing = await execute<{ items: Asset[]; total: number }>('asset.list', {
+        ...listOptions(),
         library_id: library?.id,
         limit: 200,
       });

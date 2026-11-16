@@ -355,11 +355,14 @@
   transition: opacity var(--nl-d-base) var(--nl-ease);
 }
 .controls-hidden .viewer-controls,
+.controls-hidden .nl-video-bar.is-playing,
 .controls-hidden .viewer-nav {
   opacity: 0;
   pointer-events: none;
 }
 .controls-hidden .viewer-controls:focus-within,
+.controls-hidden .nl-video-bar:focus-within,
+.controls-hidden .nl-video-bar:hover,
 .controls-hidden .viewer-nav:focus-visible {
   opacity: 1;
   pointer-events: auto;
