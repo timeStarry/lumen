@@ -978,7 +978,6 @@ export default function Viewer(props: {
     activity();
   }
   function cullKeyboard(event: KeyboardEvent): boolean {
-    if (event.key === ' ' && event.target instanceof HTMLVideoElement) return true;
     if (
       event.key.toLowerCase() === 'm' &&
       !event.metaKey &&
@@ -1222,7 +1221,6 @@ export default function Viewer(props: {
       (!isControl(document.activeElement) ||
         (asset()?.kind === 'video' && document.activeElement instanceof HTMLInputElement))
     ) {
-      if (event.target instanceof HTMLVideoElement) return;
       event.preventDefault();
       if (asset()?.kind === 'video' && toggleVideoPlay) toggleVideoPlay();
       else void escape();

@@ -5,6 +5,7 @@ use anyhow::Result;
 use rusqlite::Transaction;
 
 const KEY: &str = "inspection.nikon-z5ii.v1";
+const VIDEO_META_V2_KEY: &str = "inspection.video-meta.v2";
 
 pub(super) fn invalidate(transaction: &Transaction<'_>) -> Result<()> {
     let applied: bool = transaction.query_row(
@@ -20,6 +21,29 @@ pub(super) fn invalidate(transaction: &Transaction<'_>) -> Result<()> {
             [],
         )?;
         transaction.execute("INSERT INTO app_settings(key,value) VALUES(?1,'1')", [KEY])?;
+    }
+
+    let video_v2_applied: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM app_settings WHERE key=?1)",
+        [VIDEO_META_V2_KEY],
+        |row| row.get(0),
+    )?;
+    if !video_v2_applied {
+        // Re-inspect previously indexed local and remote videos once so camera/lens/exposure
+        // atoms (Nikon NCDT/NCTG, Canon CMT, Sony NRTM) and camera-local capture timestamps
+        // upgrade cleanly without touching any photo rows or user marks.
+        transaction.execute(
+            "UPDATE assets SET modified_stamp='' WHERE source_key IS NULL AND kind='video'",
+            [],
+        )?;
+        transaction.execute(
+            "UPDATE assets SET captured_at_checked=0 WHERE source_key IS NOT NULL AND kind='video'",
+            [],
+        )?;
+        transaction.execute(
+            "INSERT INTO app_settings(key,value) VALUES(?1,'1')",
+            [VIDEO_META_V2_KEY],
+        )?;
     }
     Ok(())
 }

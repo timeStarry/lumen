@@ -41,24 +41,6 @@ function renderVideoSlateCanvas(width = 1280, height = 720): HTMLCanvasElement {
   if (ctx) {
     ctx.fillStyle = '#1e1f22';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
-    const radius = Math.max(16, Math.round(Math.min(canvas.width, canvas.height) * 0.1));
-    const cx = canvas.width / 2;
-    const cy = canvas.height / 2;
-    ctx.beginPath();
-    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-    ctx.fillStyle = '#2d2f34';
-    ctx.fill();
-    ctx.strokeStyle = '#5c6068';
-    ctx.lineWidth = Math.max(1.5, radius * 0.06);
-    ctx.stroke();
-    ctx.beginPath();
-    const tri = radius * 0.42;
-    ctx.moveTo(cx - tri * 0.55, cy - tri * 0.72);
-    ctx.lineTo(cx - tri * 0.55, cy + tri * 0.72);
-    ctx.lineTo(cx + tri * 0.82, cy);
-    ctx.closePath();
-    ctx.fillStyle = '#dcdde0';
-    ctx.fill();
   }
   return canvas;
 }

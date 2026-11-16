@@ -8,13 +8,16 @@
 use std::{
     collections::BTreeMap,
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{Cursor, Read, Seek, SeekFrom},
     path::Path,
 };
 
 use anyhow::{bail, ensure, Context, Result};
 use chrono::DateTime;
-use image::{DynamicImage, Rgb, RgbImage};
+use exif::{In, Tag};
+use image::{
+    metadata::Orientation, DynamicImage, ImageDecoder, ImageFormat, ImageReader, Rgb, RgbImage,
+};
 
 use crate::imaging::Inspection;
 
@@ -25,8 +28,10 @@ pub const VIDEO_EXTENSIONS: &[&str] = &[
 
 /// Seconds between QuickTime epoch (`1904-01-01T00:00:00Z`) and Unix epoch (`1970-01-01T00:00:00Z`).
 const QUICKTIME_EPOCH_OFFSET: u64 = 2_082_844_800;
-const MAX_VIDEO_META_READ_BYTES: u64 = 1024 * 1024;
-const MAX_BOXES: usize = 1536;
+const MAX_VIDEO_META_READ_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_EMBEDDED_JPEG_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_FIRST_SAMPLE_BYTES: u32 = 2 * 1024 * 1024;
+const MAX_BOXES: usize = 2048;
 
 pub fn is_video_extension(ext: &str) -> bool {
     let lower = ext.trim_start_matches('.').to_ascii_lowercase();
@@ -214,10 +219,19 @@ impl<R: Read + Seek> BmffCursor<'_, R> {
     }
 }
 
+#[derive(Clone)]
+struct FirstVideoSample {
+    tkhd_box: Vec<u8>,
+    stsd_box: Vec<u8>,
+    offset: u64,
+    size: u32,
+}
+
 #[derive(Default)]
 struct BmffVideoInfo {
     width: u32,
     height: u32,
+    rotation_degrees: u16,
     duration_secs: Option<f64>,
     mvhd_creation_qt: Option<u64>,
     codec: Option<String>,
@@ -225,30 +239,91 @@ struct BmffVideoInfo {
     make: Option<String>,
     model: Option<String>,
     lens: Option<String>,
+    software: Option<String>,
+    exposure: Option<String>,
+    aperture: Option<String>,
+    iso: Option<String>,
+    exposure_bias: Option<String>,
+    focal_length: Option<String>,
+    focal_length_35mm: Option<String>,
+    white_balance: Option<String>,
     creation_iso: Option<String>,
+    camera_captured_exif: Option<String>,
+    embedded_jpegs: Vec<(u64, u64)>,
+    ftyp_box: Option<Vec<u8>>,
+    first_sample: Option<FirstVideoSample>,
+}
+
+struct BmffDetail {
+    inspection: Inspection,
+    rotation_degrees: u16,
+    embedded_jpegs: Vec<(u64, u64)>,
+    ftyp_box: Option<Vec<u8>>,
+    first_sample: Option<FirstVideoSample>,
 }
 
 fn inspect_bmff<R: Read + Seek>(input: &mut R, length: u64, ext: &str) -> Result<Inspection> {
-    let mut reader = BmffCursor {
-        input,
-        file_len: length,
-        read_bytes: 0,
-        boxes_seen: 0,
-    };
+    Ok(inspect_bmff_detail(input, length, ext)?.inspection)
+}
+
+fn inspect_bmff_detail<R: Read + Seek>(
+    input: &mut R,
+    length: u64,
+    ext: &str,
+) -> Result<BmffDetail> {
     let mut info = BmffVideoInfo::default();
     let mut saw_moov = false;
-    let mut cursor = 0_u64;
-    while let Some(b) = reader.next_box(cursor, length)? {
-        if &b.kind == b"moov" {
-            saw_moov = true;
-            parse_moov(&mut reader, b.payload_offset, b.next_offset, &mut info)?;
+    {
+        let mut reader = BmffCursor {
+            input,
+            file_len: length,
+            read_bytes: 0,
+            boxes_seen: 0,
+        };
+        let mut cursor = 0_u64;
+        while let Some(b) = reader.next_box(cursor, length)? {
+            match &b.kind {
+                b"ftyp" if b.payload_len <= 256 && info.ftyp_box.is_none() => {
+                    let payload = reader.read_slice(b.payload_offset, b.payload_len)?;
+                    info.ftyp_box = Some(wrap_box(&b.kind, &payload));
+                }
+                b"moov" => {
+                    saw_moov = true;
+                    parse_moov(&mut reader, b.payload_offset, b.next_offset, &mut info)?;
+                }
+                b"meta" => {
+                    parse_qt_meta(&mut reader, b.payload_offset, b.next_offset, &mut info)?;
+                }
+                b"uuid" => {
+                    parse_vendor_uuid(&mut reader, b.payload_offset, b.next_offset, &mut info)?;
+                }
+                _ => {}
+            }
+            cursor = b.next_offset;
         }
-        cursor = b.next_offset;
     }
     ensure!(
         saw_moov,
         "E_UNSUPPORTED_CODEC: Video container has no moov metadata track"
     );
+
+    // Prefer largest embedded preview (e.g. Nikon NCM1/NCVW 640p..1080p) ahead of tiny NCTH 160x120.
+    info.embedded_jpegs.sort_by(|a, b| b.1.cmp(&a.1));
+    info.embedded_jpegs.dedup();
+
+    // Supplement missing camera/lens/exposure fields from the embedded preview JPEG's APP1 EXIF header.
+    if (info.model.is_none() || info.lens.is_none() || info.focal_length.is_none())
+        && !info.embedded_jpegs.is_empty()
+    {
+        let (off, len) = info.embedded_jpegs[0];
+        let probe_len = len.min(64 * 1024);
+        if off.checked_add(probe_len).is_some_and(|end| end <= length) {
+            let mut probe = vec![0_u8; probe_len as usize];
+            if input.seek(SeekFrom::Start(off)).is_ok() && input.read_exact(&mut probe).is_ok() {
+                supplement_from_embedded_jpeg_exif(&probe, &mut info);
+            }
+        }
+    }
 
     let width = if info.width > 0 { info.width } else { 1920 };
     let height = if info.height > 0 { info.height } else { 1080 };
@@ -271,18 +346,31 @@ fn inspect_bmff<R: Read + Seek>(input: &mut R, length: u64, ext: &str) -> Result
         };
         metadata.insert("Frame Rate".into(), formatted);
     }
-    if let Some(make) = info.make.filter(|s| !s.is_empty()) {
-        metadata.insert("Make".into(), make);
-    }
-    if let Some(model) = info.model.filter(|s| !s.is_empty()) {
-        metadata.insert("Camera".into(), model);
-    }
-    if let Some(lens) = info.lens.filter(|s| !s.is_empty()) {
-        metadata.insert("Lens".into(), lens);
+    for (key, value) in [
+        ("Make", info.make),
+        ("Camera", info.model),
+        ("Lens", info.lens),
+        ("Software", info.software),
+        ("Exposure", info.exposure),
+        ("Aperture", info.aperture),
+        ("ISO", info.iso),
+        ("Exposure Bias", info.exposure_bias),
+        ("Focal Length", info.focal_length),
+        ("Focal Length (35 mm)", info.focal_length_35mm),
+        ("White Balance", info.white_balance),
+    ] {
+        if let Some(val) = value.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()) {
+            metadata.insert(key.into(), val);
+        }
     }
 
     if let Some(iso) = info.creation_iso.as_deref() {
         apply_iso_creation_date(iso, &mut metadata);
+    }
+    if !metadata.contains_key("Captured") {
+        if let Some(exif_dt) = info.camera_captured_exif.as_deref() {
+            apply_exif_creation_date(exif_dt, &mut metadata);
+        }
     }
     if !metadata.contains_key("Captured") {
         if let Some(qt_secs) = info.mvhd_creation_qt.filter(|v| *v > QUICKTIME_EPOCH_OFFSET) {
@@ -296,11 +384,309 @@ fn inspect_bmff<R: Read + Seek>(input: &mut R, length: u64, ext: &str) -> Result
         }
     }
 
-    Ok(Inspection {
-        width,
-        height,
-        metadata,
+    Ok(BmffDetail {
+        inspection: Inspection {
+            width,
+            height,
+            metadata,
+        },
+        rotation_degrees: info.rotation_degrees,
+        embedded_jpegs: info.embedded_jpegs,
+        ftyp_box: info.ftyp_box,
+        first_sample: info.first_sample,
     })
+}
+
+/// Bounded cover-frame + metadata extractor for remote (HTTP Range) and streamed videos.
+///
+/// Tier 1 (cross-platform, 0 extra requests beyond `moov` + preview box): extracts camera-embedded
+/// cover JPEGs (`NCDT -> NCM1/NCVW/NCTH`, `CNTH -> CNDA`, `THMB`, `ilst -> covr`).
+/// Tier 2 (macOS hardware decode, single bounded range read `<= 2 MiB`): reads Sample 0 of the
+/// primary video track, wraps a minimal 1-sample MOV in memory, and decodes via `AVFoundation`.
+/// Tier 3: clean neutral darkroom slate matching the clip's aspect ratio.
+pub(crate) fn extract_remote_poster_and_inspect<R: Read + Seek>(
+    input: &mut R,
+    length: u64,
+    ext: &str,
+    max_side: u32,
+) -> Result<(Inspection, DynamicImage, Option<Vec<u8>>, &'static str)> {
+    ensure!(
+        length >= 12,
+        "E_UNSUPPORTED_CODEC: Video file is empty or truncated"
+    );
+    let ext_lower = ext.trim_start_matches('.').to_ascii_lowercase();
+    let mut head = [0_u8; 16];
+    let head_len = length.min(16) as usize;
+    input.seek(SeekFrom::Start(0))?;
+    input.read_exact(&mut head[..head_len])?;
+
+    if head_len >= 8 && is_bmff_root_box(&head[4..8]) {
+        let mut detail = inspect_bmff_detail(input, length, &ext_lower)?;
+        let w = detail.inspection.width;
+        let h = detail.inspection.height;
+
+        // Tier 1: Camera-embedded cover JPEG inside `moov` / `udta` / `meta`.
+        for &(offset, len) in &detail.embedded_jpegs {
+            if len < 64 || len > MAX_EMBEDDED_JPEG_BYTES {
+                continue;
+            }
+            let Some(end) = offset.checked_add(len) else {
+                continue;
+            };
+            if end > length {
+                continue;
+            }
+            let mut raw = vec![0_u8; len as usize];
+            if input.seek(SeekFrom::Start(offset)).is_ok() && input.read_exact(&mut raw).is_ok() {
+                if let Some((img, icc)) =
+                    decode_embedded_cover_jpeg(&raw, detail.rotation_degrees, w, h, max_side)
+                {
+                    detail
+                        .inspection
+                        .metadata
+                        .insert("Preview Source".into(), "video_embedded_jpeg".into());
+                    detail
+                        .inspection
+                        .metadata
+                        .insert("Decoder".into(), "相机视频内嵌封面".into());
+                    return Ok((detail.inspection, img, icc, "video_embedded_jpeg"));
+                }
+            }
+        }
+
+        // Tier 2: Bounded Sample-0 range read + hardware keyframe decode on macOS.
+        #[cfg(target_os = "macos")]
+        if let Some(sample) = &detail.first_sample {
+            if (16..=MAX_FIRST_SAMPLE_BYTES).contains(&sample.size) {
+                if let Some(end) = sample.offset.checked_add(u64::from(sample.size)) {
+                    if end <= length {
+                        let mut sample_bytes = vec![0_u8; sample.size as usize];
+                        if input.seek(SeekFrom::Start(sample.offset)).is_ok()
+                            && input.read_exact(&mut sample_bytes).is_ok()
+                        {
+                            let mini_mov = build_single_sample_mov(
+                                detail.ftyp_box.as_deref(),
+                                &sample.tkhd_box,
+                                &sample.stsd_box,
+                                &sample_bytes,
+                            );
+                            if let Ok((img, icc)) =
+                                crate::macos_video::extract_poster_from_bytes(&mini_mov, max_side)
+                            {
+                                detail
+                                    .inspection
+                                    .metadata
+                                    .insert("Preview Source".into(), "video_frame".into());
+                                detail
+                                    .inspection
+                                    .metadata
+                                    .insert("Decoder".into(), "macOS AVFoundation 首帧解码".into());
+                                return Ok((detail.inspection, img, icc, "video_frame"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        detail
+            .inspection
+            .metadata
+            .insert("Preview Source".into(), "video_slate".into());
+        let slate = render_slate_poster(w, h, max_side);
+        return Ok((detail.inspection, slate, None, "video_slate"));
+    }
+
+    let mut inspection = inspect_reader(input, length, &ext_lower)?;
+    inspection
+        .metadata
+        .insert("Preview Source".into(), "video_slate".into());
+    let slate = render_slate_poster(inspection.width, inspection.height, max_side);
+    Ok((inspection, slate, None, "video_slate"))
+}
+
+/// Cross-platform embedded cover JPEG fallback for local video files (used when native OS
+/// frame decoding is unavailable or rejects a vendor codec).
+pub(crate) fn extract_embedded_cover_path(
+    path: &Path,
+    max_side: u32,
+) -> Option<(DynamicImage, Option<Vec<u8>>)> {
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let ext = path
+        .extension()
+        .and_then(|v| v.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let detail = inspect_bmff_detail(&mut file, len, &ext).ok()?;
+    for (offset, size) in detail.embedded_jpegs {
+        if !(64..=MAX_EMBEDDED_JPEG_BYTES).contains(&size)
+            || offset.checked_add(size).is_none_or(|e| e > len)
+        {
+            continue;
+        }
+        let mut raw = vec![0_u8; size as usize];
+        if file.seek(SeekFrom::Start(offset)).is_ok() && file.read_exact(&mut raw).is_ok() {
+            if let Some(decoded) = decode_embedded_cover_jpeg(
+                &raw,
+                detail.rotation_degrees,
+                detail.inspection.width,
+                detail.inspection.height,
+                max_side,
+            ) {
+                return Some(decoded);
+            }
+        }
+    }
+    None
+}
+
+fn wrap_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    let size = u32::try_from(8 + payload.len()).unwrap_or(u32::MAX);
+    let mut out = Vec::with_capacity(8 + payload.len());
+    out.extend_from_slice(&size.to_be_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(payload);
+    out
+}
+
+fn decode_embedded_cover_jpeg(
+    raw: &[u8],
+    rotation_degrees: u16,
+    video_w: u32,
+    video_h: u32,
+    max_side: u32,
+) -> Option<(DynamicImage, Option<Vec<u8>>)> {
+    let scan_bound = raw.len().min(96);
+    let soi = raw[..scan_bound]
+        .windows(3)
+        .position(|w| w == [0xFF, 0xD8, 0xFF])?;
+    let jpeg_bytes = &raw[soi..];
+    let mut reader = ImageReader::with_format(Cursor::new(jpeg_bytes), ImageFormat::Jpeg);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    reader.limits(limits);
+    let mut decoder = reader.into_decoder().ok()?;
+    let (w, h) = decoder.dimensions();
+    if w < 64 || h < 64 {
+        return None;
+    }
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let icc = decoder.icc_profile().ok().flatten();
+    let mut img = DynamicImage::from_decoder(decoder).ok()?;
+    img.apply_orientation(orientation);
+    if orientation == Orientation::NoTransforms {
+        match rotation_degrees {
+            90 if (img.width() > img.height()) != (video_w > video_h) => img = img.rotate90(),
+            180 => img = img.rotate180(),
+            270 if (img.width() > img.height()) != (video_w > video_h) => img = img.rotate270(),
+            _ => {}
+        }
+    }
+    let limit = max_side.clamp(64, 4096);
+    if img.width() > limit || img.height() > limit {
+        img = img.thumbnail(limit, limit);
+    }
+    Some((img, icc))
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn build_single_sample_mov(
+    ftyp_box: Option<&[u8]>,
+    tkhd_box: &[u8],
+    stsd_box: &[u8],
+    sample_bytes: &[u8],
+) -> Vec<u8> {
+    let ftyp = match ftyp_box.filter(|b| b.len() >= 16) {
+        Some(existing) => existing.to_vec(),
+        None => wrap_box(b"ftyp", b"qt  \x00\x00\x02\x00qt  isommp42"),
+    };
+    let mdat = wrap_box(b"mdat", sample_bytes);
+    let sample_offset = u32::try_from(ftyp.len() + 8).unwrap_or(0);
+
+    let mut mvhd_payload = vec![0_u8; 100];
+    mvhd_payload[12..16].copy_from_slice(&600_u32.to_be_bytes());
+    mvhd_payload[16..20].copy_from_slice(&600_u32.to_be_bytes());
+    mvhd_payload[20..24].copy_from_slice(&0x0001_0000_u32.to_be_bytes());
+    mvhd_payload[24..26].copy_from_slice(&0x0100_u16.to_be_bytes());
+    mvhd_payload[36..40].copy_from_slice(&0x0001_0000_u32.to_be_bytes());
+    mvhd_payload[52..56].copy_from_slice(&0x0001_0000_u32.to_be_bytes());
+    mvhd_payload[68..72].copy_from_slice(&0x4000_0000_u32.to_be_bytes());
+    mvhd_payload[96..100].copy_from_slice(&2_u32.to_be_bytes());
+    let mvhd = wrap_box(b"mvhd", &mvhd_payload);
+
+    let mut tkhd = tkhd_box.to_vec();
+    if tkhd.len() >= 92 {
+        tkhd[11] |= 0x03; // track_enabled | track_in_movie
+        if tkhd[8] == 1 && tkhd.len() >= 104 {
+            tkhd[28..32].copy_from_slice(&1_u32.to_be_bytes());
+            tkhd[36..44].copy_from_slice(&600_u64.to_be_bytes());
+        } else {
+            tkhd[20..24].copy_from_slice(&1_u32.to_be_bytes());
+            tkhd[28..32].copy_from_slice(&600_u32.to_be_bytes());
+        }
+    }
+
+    let mut mdhd_payload = vec![0_u8; 24];
+    mdhd_payload[12..16].copy_from_slice(&600_u32.to_be_bytes());
+    mdhd_payload[16..20].copy_from_slice(&600_u32.to_be_bytes());
+    let mdhd = wrap_box(b"mdhd", &mdhd_payload);
+
+    let mut hdlr_payload = vec![0_u8; 24];
+    hdlr_payload[4..8].copy_from_slice(b"mhlr");
+    hdlr_payload[8..12].copy_from_slice(b"vide");
+    let hdlr = wrap_box(b"hdlr", &hdlr_payload);
+
+    let mut vmhd_payload = vec![0_u8; 12];
+    vmhd_payload[3] = 1;
+    let vmhd = wrap_box(b"vmhd", &vmhd_payload);
+
+    let url_entry = wrap_box(b"url ", &[0, 0, 0, 1]);
+    let mut dref_payload = Vec::with_capacity(8 + url_entry.len());
+    dref_payload.extend_from_slice(&0_u32.to_be_bytes());
+    dref_payload.extend_from_slice(&1_u32.to_be_bytes());
+    dref_payload.extend_from_slice(&url_entry);
+    let dinf = wrap_box(b"dinf", &wrap_box(b"dref", &dref_payload));
+
+    let mut stts_payload = Vec::with_capacity(16);
+    stts_payload.extend_from_slice(&0_u32.to_be_bytes());
+    stts_payload.extend_from_slice(&1_u32.to_be_bytes());
+    stts_payload.extend_from_slice(&1_u32.to_be_bytes());
+    stts_payload.extend_from_slice(&600_u32.to_be_bytes());
+    let stts = wrap_box(b"stts", &stts_payload);
+
+    let mut stsc_payload = Vec::with_capacity(20);
+    stsc_payload.extend_from_slice(&0_u32.to_be_bytes());
+    stsc_payload.extend_from_slice(&1_u32.to_be_bytes());
+    stsc_payload.extend_from_slice(&1_u32.to_be_bytes());
+    stsc_payload.extend_from_slice(&1_u32.to_be_bytes());
+    stsc_payload.extend_from_slice(&1_u32.to_be_bytes());
+    let stsc = wrap_box(b"stsc", &stsc_payload);
+
+    let mut stsz_payload = Vec::with_capacity(12);
+    stsz_payload.extend_from_slice(&0_u32.to_be_bytes());
+    stsz_payload.extend_from_slice(&(sample_bytes.len() as u32).to_be_bytes());
+    stsz_payload.extend_from_slice(&1_u32.to_be_bytes());
+    let stsz = wrap_box(b"stsz", &stsz_payload);
+
+    let mut stco_payload = Vec::with_capacity(12);
+    stco_payload.extend_from_slice(&0_u32.to_be_bytes());
+    stco_payload.extend_from_slice(&1_u32.to_be_bytes());
+    stco_payload.extend_from_slice(&sample_offset.to_be_bytes());
+    let stco = wrap_box(b"stco", &stco_payload);
+
+    let stbl = wrap_box(
+        b"stbl",
+        &[stsd_box.to_vec(), stts, stsc, stsz, stco].concat(),
+    );
+    let minf = wrap_box(b"minf", &[vmhd, dinf, stbl].concat());
+    let mdia = wrap_box(b"mdia", &[mdhd, hdlr, minf].concat());
+    let trak = wrap_box(b"trak", &[tkhd, mdia].concat());
+    let moov = wrap_box(b"moov", &[mvhd, trak].concat());
+
+    [ftyp, mdat, moov].concat()
 }
 
 fn parse_moov<R: Read + Seek>(
@@ -316,6 +702,7 @@ fn parse_moov<R: Read + Seek>(
             b"trak" => parse_trak(reader, b.payload_offset, b.next_offset, info)?,
             b"meta" => parse_qt_meta(reader, b.payload_offset, b.next_offset, info)?,
             b"udta" => parse_udta(reader, b.payload_offset, b.next_offset, info)?,
+            b"uuid" => parse_vendor_uuid(reader, b.payload_offset, b.next_offset, info)?,
             _ => {}
         }
         cursor = b.next_offset;
@@ -363,10 +750,14 @@ struct TrackCandidate {
     is_video: bool,
     width: u32,
     height: u32,
-    rotated_90_or_270: bool,
+    rotation_degrees: u16,
     codec: Option<String>,
     mdhd_duration_secs: Option<f64>,
     sample_count: Option<u64>,
+    tkhd_box: Option<Vec<u8>>,
+    stsd_box: Option<Vec<u8>>,
+    first_sample_size: Option<u32>,
+    first_chunk_offset: Option<u64>,
 }
 
 fn parse_trak<R: Read + Seek>(
@@ -387,13 +778,14 @@ fn parse_trak<R: Read + Seek>(
     }
     if track.is_video && (info.width == 0 || info.height == 0) {
         let (mut w, mut h) = (track.width, track.height);
-        if track.rotated_90_or_270 && w > 0 && h > 0 {
+        if matches!(track.rotation_degrees, 90 | 270) && w > 0 && h > 0 {
             std::mem::swap(&mut w, &mut h);
         }
         if w > 0 && h > 0 {
             info.width = w;
             info.height = h;
         }
+        info.rotation_degrees = track.rotation_degrees;
         if info.codec.is_none() {
             info.codec = track.codec;
         }
@@ -403,9 +795,27 @@ fn parse_trak<R: Read + Seek>(
         if info.fps.is_none() {
             if let (Some(samples), Some(secs)) = (
                 track.sample_count.filter(|c| *c > 1),
-                track.mdhd_duration_secs.or(info.duration_secs).filter(|s| *s > 0.05),
+                track
+                    .mdhd_duration_secs
+                    .or(info.duration_secs)
+                    .filter(|s| *s > 0.05),
             ) {
                 info.fps = Some(samples as f64 / secs);
+            }
+        }
+        if info.first_sample.is_none() {
+            if let (Some(tkhd_box), Some(stsd_box), Some(offset), Some(size)) = (
+                track.tkhd_box,
+                track.stsd_box,
+                track.first_chunk_offset,
+                track.first_sample_size,
+            ) {
+                info.first_sample = Some(FirstVideoSample {
+                    tkhd_box,
+                    stsd_box,
+                    offset,
+                    size,
+                });
             }
         }
     }
@@ -420,8 +830,11 @@ fn parse_tkhd<R: Read + Seek>(
     if b.payload_len < 84 {
         return Ok(());
     }
-    let need = b.payload_len.min(96);
+    let need = b.payload_len.min(128);
     let data = reader.read_slice(b.payload_offset, need)?;
+    if b.payload_len <= 128 {
+        track.tkhd_box = Some(wrap_box(&b.kind, &data));
+    }
     let version = data[0];
     let (matrix_offset, dims_offset) = if version == 1 {
         (52_usize, 88_usize)
@@ -436,7 +849,21 @@ fn parse_tkhd<R: Read + Seek>(
     let c_mat =
         i32::from_be_bytes(data[matrix_offset + 12..matrix_offset + 16].try_into().unwrap());
     let d = i32::from_be_bytes(data[matrix_offset + 16..matrix_offset + 20].try_into().unwrap());
-    track.rotated_90_or_270 = a == 0 && d == 0 && (b_mat != 0 || c_mat != 0);
+    track.rotation_degrees = if a == 0 && d == 0 {
+        if b_mat > 0 && c_mat < 0 {
+            90
+        } else if b_mat < 0 && c_mat > 0 {
+            270
+        } else if b_mat != 0 || c_mat != 0 {
+            90
+        } else {
+            0
+        }
+    } else if a < 0 && d < 0 && b_mat == 0 && c_mat == 0 {
+        180
+    } else {
+        0
+    };
 
     let width_fixed = u32::from_be_bytes(data[dims_offset..dims_offset + 4].try_into().unwrap());
     let height_fixed =
@@ -512,8 +939,11 @@ fn parse_stbl<R: Read + Seek>(
     while let Some(b) = reader.next_box(cursor, end)? {
         match &b.kind {
             b"stsd" if b.payload_len >= 16 => {
-                let len = b.payload_len.min(64);
+                let len = b.payload_len.min(16 * 1024);
                 let data = reader.read_slice(b.payload_offset, len)?;
+                if b.payload_len <= 16 * 1024 {
+                    track.stsd_box = Some(wrap_box(&b.kind, &data));
+                }
                 let entry_count = u32::from_be_bytes(data[4..8].try_into().unwrap());
                 if entry_count >= 1 && data.len() >= 16 {
                     let fourcc = &data[12..16];
@@ -530,10 +960,40 @@ fn parse_stbl<R: Read + Seek>(
                 }
             }
             b"stsz" if b.payload_len >= 12 => {
-                let data = reader.read_slice(b.payload_offset, 12)?;
+                let len = b.payload_len.min(16);
+                let data = reader.read_slice(b.payload_offset, len)?;
+                let uniform_size = u32::from_be_bytes(data[4..8].try_into().unwrap());
                 let count = u32::from_be_bytes(data[8..12].try_into().unwrap());
                 if count > 0 {
                     track.sample_count = Some(u64::from(count));
+                    if uniform_size > 0 {
+                        track.first_sample_size = Some(uniform_size);
+                    } else if data.len() >= 16 {
+                        let first = u32::from_be_bytes(data[12..16].try_into().unwrap());
+                        if first > 0 {
+                            track.first_sample_size = Some(first);
+                        }
+                    }
+                }
+            }
+            b"stco" if b.payload_len >= 12 => {
+                let data = reader.read_slice(b.payload_offset, 12)?;
+                let count = u32::from_be_bytes(data[4..8].try_into().unwrap());
+                if count >= 1 {
+                    let offset = u32::from_be_bytes(data[8..12].try_into().unwrap());
+                    if offset > 0 {
+                        track.first_chunk_offset = Some(u64::from(offset));
+                    }
+                }
+            }
+            b"co64" if b.payload_len >= 16 => {
+                let data = reader.read_slice(b.payload_offset, 16)?;
+                let count = u32::from_be_bytes(data[4..8].try_into().unwrap());
+                if count >= 1 {
+                    let offset = u64::from_be_bytes(data[8..16].try_into().unwrap());
+                    if offset > 0 {
+                        track.first_chunk_offset = Some(offset);
+                    }
                 }
             }
             _ => {}
@@ -558,6 +1018,29 @@ fn codec_label(fourcc: &[u8]) -> String {
     }
 }
 
+fn read_qt_text_atom<R: Read + Seek>(
+    reader: &mut BmffCursor<'_, R>,
+    b: BmffBox,
+) -> Result<Option<String>> {
+    if b.payload_len < 4 {
+        return Ok(None);
+    }
+    let len = b.payload_len.min(256);
+    let raw = reader.read_slice(b.payload_offset, len)?;
+    // Classic QuickTime text atom: [u16 str_len, u16 lang, utf8...]
+    let str_len = usize::from(u16::from_be_bytes([raw[0], raw[1]]));
+    if str_len > 0 && 4 + str_len <= raw.len() {
+        if let Ok(s) = std::str::from_utf8(&raw[4..4 + str_len]) {
+            let trimmed = s.trim_matches(|c: char| c == '\0' || c.is_ascii_whitespace());
+            if !trimmed.is_empty() {
+                return Ok(Some(trimmed.to_owned()));
+            }
+        }
+    }
+    // Some cameras write child `data` atom inside `©mak` / `©mod` instead of raw QuickTime text.
+    read_ilst_utf8_value(reader, b.payload_offset, b.next_offset)
+}
+
 fn parse_udta<R: Read + Seek>(
     reader: &mut BmffCursor<'_, R>,
     start: u64,
@@ -566,28 +1049,441 @@ fn parse_udta<R: Read + Seek>(
 ) -> Result<()> {
     let mut cursor = start;
     while let Some(b) = reader.next_box(cursor, end)? {
-        if &b.kind == b"meta" {
-            parse_qt_meta(reader, b.payload_offset, b.next_offset, info)?;
-        } else if &b.kind == b"\xa9day" && b.payload_len >= 4 && info.creation_iso.is_none() {
-            let len = b.payload_len.min(128);
-            let raw = reader.read_slice(b.payload_offset, len)?;
-            // QuickTime text atom: [u16 str_len, u16 lang, utf8...]
-            if raw.len() >= 4 {
-                let str_len = usize::from(u16::from_be_bytes([raw[0], raw[1]]));
-                if str_len > 0 && 4 + str_len <= raw.len() {
-                    if let Ok(s) = std::str::from_utf8(&raw[4..4 + str_len]) {
-                        info.creation_iso = Some(s.trim().to_owned());
-                    }
+        match &b.kind {
+            b"meta" => parse_qt_meta(reader, b.payload_offset, b.next_offset, info)?,
+            b"NCDT" => parse_nikon_ncdt(reader, b.payload_offset, b.next_offset, info)?,
+            b"CNTH" => parse_canon_cnth(reader, b.payload_offset, b.next_offset, info)?,
+            b"CMT1" | b"CMT2" if (16..=256 * 1024).contains(&b.payload_len) => {
+                let raw = reader.read_slice(b.payload_offset, b.payload_len)?;
+                parse_raw_exif_tiff(&raw, info);
+            }
+            b"THMB" if (128..=MAX_EMBEDDED_JPEG_BYTES).contains(&b.payload_len) => {
+                info.embedded_jpegs.push((b.payload_offset, b.payload_len));
+            }
+            b"\xa9day" if info.creation_iso.is_none() => {
+                if let Some(val) = read_qt_text_atom(reader, b)? {
+                    info.creation_iso = Some(val);
                 }
             }
+            b"\xa9mak" if info.make.is_none() => {
+                info.make = read_qt_text_atom(reader, b)?;
+            }
+            b"\xa9mod" if info.model.is_none() => {
+                info.model = read_qt_text_atom(reader, b)?;
+            }
+            b"\xa9swr" if info.software.is_none() => {
+                info.software = read_qt_text_atom(reader, b)?;
+            }
+            b"\xa9len" | b"lens" if info.lens.is_none() => {
+                info.lens = read_qt_text_atom(reader, b)?;
+            }
+            _ => {}
         }
         cursor = b.next_offset;
     }
     Ok(())
 }
 
-/// Parses QuickTime `meta` (`hdlr` = `mdta`, `keys` + `ilst`) for camera Make, Model,
-/// Lens, and `com.apple.quicktime.creationdate`.
+/// Canon MP4/MOV files embed `CMT1` (IFD0), `CMT2` (ExifIFD), and `CNTH` (`CNDA` JPEG)
+/// inside a vendor `uuid` container (`85c0b687-820f-11e0-8111-f4ce462b6a48`).
+fn parse_vendor_uuid<R: Read + Seek>(
+    reader: &mut BmffCursor<'_, R>,
+    start: u64,
+    end: u64,
+    info: &mut BmffVideoInfo,
+) -> Result<()> {
+    if end.saturating_sub(start) < 24 {
+        return Ok(());
+    }
+    const CANON_UUID: [u8; 16] = [
+        0x85, 0xc0, 0xb6, 0x87, 0x82, 0x0f, 0x11, 0xe0, 0x81, 0x11, 0xf4, 0xce, 0x46, 0x2b, 0x6a,
+        0x48,
+    ];
+    let uuid = reader.read_slice(start, 16)?;
+    if uuid.as_slice() != CANON_UUID {
+        return Ok(());
+    }
+    parse_udta(reader, start + 16, end, info)
+}
+
+fn parse_canon_cnth<R: Read + Seek>(
+    reader: &mut BmffCursor<'_, R>,
+    start: u64,
+    end: u64,
+    info: &mut BmffVideoInfo,
+) -> Result<()> {
+    let mut cursor = start;
+    while let Some(b) = reader.next_box(cursor, end)? {
+        if &b.kind == b"CNDA" && (128..=MAX_EMBEDDED_JPEG_BYTES).contains(&b.payload_len) {
+            info.embedded_jpegs.push((b.payload_offset, b.payload_len));
+        }
+        cursor = b.next_offset;
+    }
+    Ok(())
+}
+
+/// Parses Nikon `NCDT` (`moov -> udta -> NCDT`), recording embedded preview/thumbnail JPEG
+/// spans (`NCM1`, `NCM2`, `NCVW`, `NCTH`) without reading pixel bytes during metadata scans,
+/// and decoding `NCTG` camera/lens/exposure/timestamp tags.
+fn parse_nikon_ncdt<R: Read + Seek>(
+    reader: &mut BmffCursor<'_, R>,
+    start: u64,
+    end: u64,
+    info: &mut BmffVideoInfo,
+) -> Result<()> {
+    let mut cursor = start;
+    while let Some(b) = reader.next_box(cursor, end)? {
+        match &b.kind {
+            b"NCTG" if (12..=128 * 1024).contains(&b.payload_len) => {
+                let raw = reader.read_slice(b.payload_offset, b.payload_len)?;
+                parse_nikon_nctg(&raw, info);
+            }
+            b"NCM1" | b"NCM2" | b"NCVW" | b"NCTH"
+                if (128..=MAX_EMBEDDED_JPEG_BYTES).contains(&b.payload_len) =>
+            {
+                info.embedded_jpegs.push((b.payload_offset, b.payload_len));
+            }
+            _ => {}
+        }
+        cursor = b.next_offset;
+    }
+    Ok(())
+}
+
+fn nctg_type_size(dtype: u16) -> Option<usize> {
+    match dtype {
+        1 | 2 | 6 | 7 => Some(1),
+        3 | 8 => Some(2),
+        4 | 9 | 11 => Some(4),
+        5 | 10 | 12 => Some(8),
+        _ => None,
+    }
+}
+
+fn plausible_nctg_tag(tag: u32) -> bool {
+    let hi = tag >> 16;
+    matches!(hi, 0x0000 | 0x0001 | 0x0100 | 0x0110 | 0x0200) && tag != 0
+}
+
+fn find_nctg_records_offset(data: &[u8]) -> Option<usize> {
+    // Nikon Z-series / D-series NCTG payloads either begin directly at offset 0 or after a
+    // 24-byte header (`01 02 03 04 ...`). Probe 4-byte-aligned offsets in `0..=32` for at
+    // least two back-to-back well-formed `[tag: u32 BE, dtype: u16 BE, count: u32 BE, val]` records.
+    for start in (0..=data.len().min(32)).step_by(4) {
+        let mut pos = start;
+        let mut valid_records = 0_usize;
+        while pos + 10 <= data.len() && valid_records < 3 {
+            let tag = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
+            let dtype = u16::from_be_bytes([data[pos + 4], data[pos + 5]]);
+            let count = u32::from_be_bytes(data[pos + 6..pos + 10].try_into().unwrap()) as usize;
+            let Some(elem) = nctg_type_size(dtype) else {
+                break;
+            };
+            let Some(byte_len) = elem.checked_mul(count) else {
+                break;
+            };
+            if !plausible_nctg_tag(tag) || byte_len > 16 * 1024 || pos + 10 + byte_len > data.len()
+            {
+                break;
+            }
+            valid_records += 1;
+            pos += 10 + byte_len;
+        }
+        if valid_records >= 2 {
+            return Some(start);
+        }
+    }
+    None
+}
+
+fn parse_nikon_nctg(data: &[u8], info: &mut BmffVideoInfo) {
+    let Some(mut pos) = find_nctg_records_offset(data) else {
+        return;
+    };
+    let mut fallback_create_date: Option<String> = None;
+    let mut makernote_lens: Option<String> = None;
+    let mut makernote_iso: Option<String> = None;
+
+    let read_ascii = |val: &[u8]| -> Option<String> {
+        let s = String::from_utf8_lossy(val);
+        let trimmed = s.trim_matches(|c: char| c == '\0' || c.is_ascii_whitespace());
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    };
+    let read_uint = |dtype: u16, val: &[u8]| -> Option<u32> {
+        match dtype {
+            1 if !val.is_empty() => Some(u32::from(val[0])),
+            3 if val.len() >= 2 => Some(u32::from(u16::from_be_bytes([val[0], val[1]]))),
+            4 if val.len() >= 4 => Some(u32::from_be_bytes(val[0..4].try_into().ok()?)),
+            _ => None,
+        }
+    };
+    let read_urational = |val: &[u8]| -> Option<(u32, u32)> {
+        if val.len() < 8 {
+            return None;
+        }
+        let num = u32::from_be_bytes(val[0..4].try_into().ok()?);
+        let den = u32::from_be_bytes(val[4..8].try_into().ok()?);
+        (den > 0).then_some((num, den))
+    };
+
+    for _ in 0..512 {
+        if pos + 10 > data.len() {
+            break;
+        }
+        let tag = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
+        let dtype = u16::from_be_bytes([data[pos + 4], data[pos + 5]]);
+        let count = u32::from_be_bytes(data[pos + 6..pos + 10].try_into().unwrap()) as usize;
+        let Some(elem) = nctg_type_size(dtype) else {
+            break;
+        };
+        let Some(byte_len) = elem.checked_mul(count) else {
+            break;
+        };
+        if pos + 10 + byte_len > data.len() {
+            break;
+        }
+        let val = &data[pos + 10..pos + 10 + byte_len];
+        pos += 10 + byte_len;
+
+        match tag {
+            0x0000_0001 | 0x0110_010f | 0x0100_010f if info.make.is_none() => {
+                info.make = read_ascii(val);
+            }
+            0x0000_0002 | 0x0110_0110 | 0x0100_0110 if info.model.is_none() => {
+                info.model = read_ascii(val);
+            }
+            0x0000_0003 | 0x0110_0131 | 0x0100_0131 if info.software.is_none() => {
+                info.software = read_ascii(val);
+            }
+            0x0000_0012 | 0x0110_9003 | 0x0100_9003 => {
+                if let Some(dt) = read_ascii(val) {
+                    info.camera_captured_exif = Some(dt);
+                }
+            }
+            0x0000_0011 | 0x0110_9004 | 0x0100_9004 => {
+                if fallback_create_date.is_none() {
+                    fallback_create_date = read_ascii(val);
+                }
+            }
+            0x0110_829a | 0x0100_829a if info.exposure.is_none() => {
+                if let Some((num, den)) = read_urational(val).filter(|(n, _)| *n > 0) {
+                    info.exposure = Some(format_shutter(num, den));
+                }
+            }
+            0x0110_829d | 0x0100_829d if info.aperture.is_none() => {
+                if let Some((num, den)) = read_urational(val).filter(|(n, _)| *n > 0) {
+                    let f = f64::from(num) / f64::from(den);
+                    if (0.5..=128.0).contains(&f) {
+                        info.aperture = Some(format!("f/{}", trim_float(f, 1)));
+                    }
+                }
+            }
+            0x0110_8827 | 0x0110_8833 | 0x0100_8827 | 0x0100_8833 if info.iso.is_none() => {
+                if let Some(iso) = read_uint(dtype, val).filter(|v| (10..=3_280_000).contains(v)) {
+                    info.iso = Some(iso.to_string());
+                }
+            }
+            0x0200_0002 if makernote_iso.is_none() => {
+                // Nikon MakerNote ISO (`u16[2]`): `[0, iso]` (or `u16[1]`).
+                if dtype == 3 && val.len() >= 4 {
+                    let v1 = u16::from_be_bytes([val[2], val[3]]);
+                    let v0 = u16::from_be_bytes([val[0], val[1]]);
+                    let chosen = if v1 > 0 { v1 } else { v0 };
+                    if chosen >= 10 {
+                        makernote_iso = Some(chosen.to_string());
+                    }
+                } else if let Some(iso) = read_uint(dtype, val).filter(|v| *v >= 10) {
+                    makernote_iso = Some(iso.to_string());
+                }
+            }
+            0x0110_9204 | 0x0100_9204 if info.exposure_bias.is_none() && val.len() >= 8 => {
+                let num = i32::from_be_bytes(val[0..4].try_into().unwrap());
+                let den = i32::from_be_bytes(val[4..8].try_into().unwrap());
+                if den != 0 {
+                    let ev = f64::from(num) / f64::from(den);
+                    if (-10.0..=10.0).contains(&ev) {
+                        info.exposure_bias = Some(if ev.abs() < 0.01 {
+                            "0 EV".into()
+                        } else if ev > 0.0 {
+                            format!("+{} EV", trim_float(ev, 1))
+                        } else {
+                            format!("{} EV", trim_float(ev, 1))
+                        });
+                    }
+                }
+            }
+            0x0110_920a | 0x0100_920a if info.focal_length.is_none() => {
+                if let Some((num, den)) = read_urational(val).filter(|(n, _)| *n > 0) {
+                    let mm = f64::from(num) / f64::from(den);
+                    if (1.0..=5000.0).contains(&mm) {
+                        info.focal_length = Some(format!("{} mm", trim_float(mm, 1)));
+                    }
+                }
+            }
+            0x0110_a405 | 0x0100_a405 if info.focal_length_35mm.is_none() => {
+                if let Some(mm) = read_uint(dtype, val).filter(|v| (1..=5000).contains(v)) {
+                    info.focal_length_35mm = Some(format!("{mm} mm"));
+                }
+            }
+            0x0110_a434 | 0x0100_a434 => {
+                if let Some(lens) = read_ascii(val) {
+                    info.lens = Some(lens);
+                }
+            }
+            0x0200_0084 if makernote_lens.is_none() && dtype == 5 && val.len() >= 32 => {
+                makernote_lens = format_nikon_lens_rationals(val);
+            }
+            0x0200_0005 if info.white_balance.is_none() => {
+                info.white_balance = read_ascii(val);
+            }
+            _ => {}
+        }
+    }
+
+    if info.camera_captured_exif.is_none() {
+        info.camera_captured_exif = fallback_create_date;
+    }
+    if info.lens.is_none() {
+        info.lens = makernote_lens;
+    }
+    if info.iso.is_none() {
+        info.iso = makernote_iso;
+    }
+}
+
+fn trim_float(val: f64, precision: usize) -> String {
+    let formatted = format!("{val:.precision$}");
+    if formatted.contains('.') {
+        formatted
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_owned()
+    } else {
+        formatted
+    }
+}
+
+fn format_shutter(num: u32, den: u32) -> String {
+    let secs = f64::from(num) / f64::from(den);
+    if secs >= 1.0 {
+        format!("{} s", trim_float(secs, 1))
+    } else {
+        let denom = (f64::from(den) / f64::from(num)).round() as u32;
+        if denom > 1 {
+            format!("1/{denom} s")
+        } else {
+            format!("{} s", trim_float(secs, 2))
+        }
+    }
+}
+
+fn format_nikon_lens_rationals(val: &[u8]) -> Option<String> {
+    let r = |idx: usize| -> Option<f64> {
+        let base = idx * 8;
+        let num = u32::from_be_bytes(val[base..base + 4].try_into().ok()?);
+        let den = u32::from_be_bytes(val[base + 4..base + 8].try_into().ok()?);
+        (den > 0 && num > 0).then(|| f64::from(num) / f64::from(den))
+    };
+    let (fl_min, fl_max, f_min, f_max) = (r(0)?, r(1)?, r(2)?, r(3)?);
+    let fl_str = if (fl_min - fl_max).abs() < 0.05 {
+        format!("{} mm", trim_float(fl_min, 1))
+    } else {
+        format!("{}-{} mm", trim_float(fl_min, 1), trim_float(fl_max, 1))
+    };
+    let f_str = if (f_min - f_max).abs() < 0.05 {
+        format!("f/{}", trim_float(f_min, 1))
+    } else {
+        format!("f/{}-{}", trim_float(f_min, 1), trim_float(f_max, 1))
+    };
+    Some(format!("{fl_str} {f_str}"))
+}
+
+fn parse_raw_exif_tiff(raw: &[u8], info: &mut BmffVideoInfo) {
+    let Ok(parsed) = exif::Reader::new()
+        .continue_on_error(true)
+        .read_raw(raw.to_vec())
+        .or_else(|e| e.distill_partial_result(|_| {}))
+    else {
+        return;
+    };
+    apply_parsed_exif(&parsed, info);
+}
+
+fn supplement_from_embedded_jpeg_exif(raw: &[u8], info: &mut BmffVideoInfo) {
+    let scan_bound = raw.len().min(96);
+    let Some(soi) = raw[..scan_bound]
+        .windows(3)
+        .position(|w| w == [0xFF, 0xD8, 0xFF])
+    else {
+        return;
+    };
+    let mut cursor = Cursor::new(&raw[soi..]);
+    let Ok(parsed) = exif::Reader::new()
+        .continue_on_error(true)
+        .read_from_container(&mut cursor)
+        .or_else(|e| e.distill_partial_result(|_| {}))
+    else {
+        return;
+    };
+    apply_parsed_exif(&parsed, info);
+}
+
+fn apply_parsed_exif(exif: &exif::Exif, info: &mut BmffVideoInfo) {
+    let field_str = |tag: Tag| -> Option<String> {
+        let field = exif.get_field(tag, In::PRIMARY)?;
+        let val = if let exif::Value::Ascii(values) = &field.value {
+            values
+                .iter()
+                .filter_map(|b| {
+                    let s = String::from_utf8_lossy(b);
+                    let t = s.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+                    (!t.is_empty()).then(|| t.to_owned())
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        } else {
+            field.display_value().with_unit(exif).to_string()
+        };
+        let trimmed = val.trim();
+        (!trimmed.is_empty()).then(|| trimmed.chars().take(512).collect())
+    };
+    if info.make.is_none() {
+        info.make = field_str(Tag::Make);
+    }
+    if info.model.is_none() {
+        info.model = field_str(Tag::Model);
+    }
+    if info.lens.is_none() {
+        info.lens = field_str(Tag::LensModel);
+    }
+    if info.software.is_none() {
+        info.software = field_str(Tag::Software);
+    }
+    if info.exposure.is_none() {
+        info.exposure = field_str(Tag::ExposureTime);
+    }
+    if info.aperture.is_none() {
+        info.aperture = field_str(Tag::FNumber);
+    }
+    if info.iso.is_none() {
+        info.iso = field_str(Tag::PhotographicSensitivity);
+    }
+    if info.exposure_bias.is_none() {
+        info.exposure_bias = field_str(Tag::ExposureBiasValue);
+    }
+    if info.focal_length.is_none() {
+        info.focal_length = field_str(Tag::FocalLength);
+    }
+    if info.focal_length_35mm.is_none() {
+        info.focal_length_35mm = field_str(Tag::FocalLengthIn35mmFilm);
+    }
+    if info.camera_captured_exif.is_none() {
+        info.camera_captured_exif = field_str(Tag::DateTimeOriginal);
+    }
+}
+
+/// Parses QuickTime `meta` (`hdlr` = `mdta`, `keys` + `ilst`), classic iTunes/MP4 `ilst` (`covr`),
+/// and Sony XAVC S `NonRealTimeMeta` `xml ` atoms.
 fn parse_qt_meta<R: Read + Seek>(
     reader: &mut BmffCursor<'_, R>,
     start: u64,
@@ -598,12 +1494,12 @@ fn parse_qt_meta<R: Read + Seek>(
         return Ok(());
     }
     // ISO `FullBox` `meta` starts with 4 bytes version/flags, whereas classic QuickTime
-    // `meta` inside `moov` starts directly with child boxes (`hdlr`, `keys`, `ilst`).
+    // `meta` inside `moov` starts directly with child boxes (`hdlr`, `keys`, `ilst`, `xml `).
     let probe = reader.read_slice(start, (end - start).min(12))?;
-    let children_start = if probe.len() >= 8 && matches!(&probe[4..8], b"hdlr" | b"keys" | b"ilst")
-    {
+    let is_meta_child = |tag: &[u8]| matches!(tag, b"hdlr" | b"keys" | b"ilst" | b"xml ");
+    let children_start = if probe.len() >= 8 && is_meta_child(&probe[4..8]) {
         start
-    } else if probe.len() >= 12 && matches!(&probe[8..12], b"hdlr" | b"keys" | b"ilst") {
+    } else if probe.len() >= 12 && is_meta_child(&probe[8..12]) {
         start + 4
     } else {
         return Ok(());
@@ -632,6 +1528,10 @@ fn parse_qt_meta<R: Read + Seek>(
                 }
             }
             b"ilst" => ilst_box = Some(b),
+            b"xml " if (16..=128 * 1024).contains(&b.payload_len) => {
+                let raw = reader.read_slice(b.payload_offset, b.payload_len)?;
+                parse_sony_nrtm_xml(&raw, info);
+            }
             _ => {}
         }
         cursor = b.next_offset;
@@ -640,29 +1540,101 @@ fn parse_qt_meta<R: Read + Seek>(
     let Some(ilst) = ilst_box else {
         return Ok(());
     };
-    if keys.is_empty() {
-        return Ok(());
-    }
 
     let mut item_cursor = ilst.payload_offset;
     while let Some(item) = reader.next_box(item_cursor, ilst.next_offset)? {
-        // In QuickTime `mdta`, the 4-byte item type is a 1-based big-endian key index!
-        let idx = u32::from_be_bytes(item.kind) as usize;
-        if idx >= 1 && idx <= keys.len() {
-            if let Some(val) = read_ilst_utf8_value(reader, item.payload_offset, item.next_offset)?
-            {
-                match keys[idx - 1].as_str() {
-                    "com.apple.quicktime.make" => info.make = Some(val),
-                    "com.apple.quicktime.model" => info.model = Some(val),
-                    "com.apple.quicktime.lens_model" => info.lens = Some(val),
-                    "com.apple.quicktime.creationdate" => info.creation_iso = Some(val),
-                    _ => {}
+        if &item.kind == b"covr" {
+            collect_ilst_cover_jpegs(reader, item.payload_offset, item.next_offset, info)?;
+        } else if !keys.is_empty() {
+            // In QuickTime `mdta`, the 4-byte item type is a 1-based big-endian key index!
+            let idx = u32::from_be_bytes(item.kind) as usize;
+            if idx >= 1 && idx <= keys.len() {
+                if let Some(val) =
+                    read_ilst_utf8_value(reader, item.payload_offset, item.next_offset)?
+                {
+                    match keys[idx - 1].as_str() {
+                        "com.apple.quicktime.make" => info.make = Some(val),
+                        "com.apple.quicktime.model" => info.model = Some(val),
+                        "com.apple.quicktime.lens_model" | "com.apple.quicktime.lens.model" => {
+                            info.lens = Some(val);
+                        }
+                        "com.apple.quicktime.software" if info.software.is_none() => {
+                            info.software = Some(val);
+                        }
+                        "com.apple.quicktime.creationdate" => info.creation_iso = Some(val),
+                        _ => {}
+                    }
                 }
             }
         }
         item_cursor = item.next_offset;
     }
     Ok(())
+}
+
+fn collect_ilst_cover_jpegs<R: Read + Seek>(
+    reader: &mut BmffCursor<'_, R>,
+    start: u64,
+    end: u64,
+    info: &mut BmffVideoInfo,
+) -> Result<()> {
+    let mut cursor = start;
+    while let Some(b) = reader.next_box(cursor, end)? {
+        if &b.kind == b"data" && b.payload_len > 72 && b.payload_len <= MAX_EMBEDDED_JPEG_BYTES + 8
+        {
+            info.embedded_jpegs
+                .push((b.payload_offset + 8, b.payload_len - 8));
+        }
+        cursor = b.next_offset;
+    }
+    Ok(())
+}
+
+/// Parses Sony XAVC S / FX / Alpha `NonRealTimeMeta` XML inside `meta -> xml ` (`FullBox`).
+fn parse_sony_nrtm_xml(raw: &[u8], info: &mut BmffVideoInfo) {
+    let xml_bytes = if raw.len() > 4 && raw[0] == 0 && !raw.starts_with(b"<") {
+        &raw[4..]
+    } else {
+        raw
+    };
+    let text = String::from_utf8_lossy(xml_bytes);
+    if !text.contains("NonRealTimeMeta") {
+        return;
+    }
+    if let Some(tag) = extract_xml_element(&text, "<Device ") {
+        if info.make.is_none() {
+            info.make = extract_xml_attr(tag, "manufacturer");
+        }
+        if info.model.is_none() {
+            info.model = extract_xml_attr(tag, "modelName");
+        }
+    }
+    if let Some(tag) = extract_xml_element(&text, "<Lens ") {
+        if info.lens.is_none() {
+            info.lens = extract_xml_attr(tag, "modelName");
+        }
+    }
+    if let Some(tag) = extract_xml_element(&text, "<CreationDate ") {
+        if info.creation_iso.is_none() {
+            info.creation_iso = extract_xml_attr(tag, "value");
+        }
+    }
+}
+
+fn extract_xml_element<'a>(xml: &'a str, prefix: &str) -> Option<&'a str> {
+    let start = xml.find(prefix)?;
+    let rest = &xml[start..];
+    let end = rest.find('>')?;
+    Some(&rest[..=end])
+}
+
+fn extract_xml_attr(element: &str, attr: &str) -> Option<String> {
+    let pattern = format!("{attr}=\"");
+    let start = element.find(&pattern)? + pattern.len();
+    let rest = &element[start..];
+    let end = rest.find('"')?;
+    let val = rest[..end].trim();
+    (!val.is_empty()).then(|| val.to_owned())
 }
 
 fn read_ilst_utf8_value<R: Read + Seek>(
@@ -688,6 +1660,35 @@ fn read_ilst_utf8_value<R: Read + Seek>(
         cursor = b.next_offset;
     }
     Ok(None)
+}
+
+fn apply_exif_creation_date(raw: &str, metadata: &mut BTreeMap<String, String>) {
+    let s = raw.trim();
+    if s.len() < 19 {
+        return;
+    }
+    let b = s.as_bytes();
+    if matches!(b[4], b':' | b'-')
+        && matches!(b[7], b':' | b'-')
+        && matches!(b[10], b' ' | b'T')
+        && b[13] == b':'
+        && b[16] == b':'
+    {
+        let normalized = format!(
+            "{}:{}:{} {}",
+            &s[0..4],
+            &s[5..7],
+            &s[8..10],
+            &s[11..19]
+        );
+        if normalized
+            .bytes()
+            .enumerate()
+            .all(|(i, c)| matches!(i, 4 | 7 | 10 | 13 | 16) || c.is_ascii_digit())
+        {
+            metadata.insert("Captured".into(), normalized);
+        }
+    }
 }
 
 /// Converts ISO-8601 / QuickTime creation dates such as `"2026-08-12T18:45:09+0800"`,
@@ -877,9 +1878,9 @@ fn default_ts_inspection(ext: &str) -> Inspection {
     }
 }
 
-/// Generates a clean, aspect-ratio-preserving studio slate poster when native
-/// platform video frame decoding is unavailable (e.g., non-macOS builds, remote
-/// uncached video range previews, or non-native codecs like `.mkv`/`.mts`).
+/// Generates a clean, aspect-ratio-preserving neutral darkroom slate when neither an
+/// embedded camera cover JPEG nor native keyframe decoding is available.
+/// Never bakes rasterized icons into the bitmap (vector UI badges/buttons render crisply at any DPI).
 pub(crate) fn render_slate_poster(width: u32, height: u32, max_side: u32) -> DynamicImage {
     let src_w = width.max(1) as f64;
     let src_h = height.max(1) as f64;
@@ -891,39 +1892,14 @@ pub(crate) fn render_slate_poster(width: u32, height: u32, max_side: u32) -> Dyn
     let mut img = RgbImage::new(out_w, out_h);
     let cx = out_w as f32 * 0.5;
     let cy = out_h as f32 * 0.5;
-    let min_dim = out_w.min(out_h) as f32;
-    let ring_r = (min_dim * 0.18).clamp(14.0, 56.0);
-    let ring_r2 = ring_r * ring_r;
-    let inner_r2 = (ring_r - 1.5).max(0.0).powi(2);
 
-    // Subtle filmic charcoal background + crisp centered play disc & triangle.
     for (x, y, px) in img.enumerate_pixels_mut() {
-        let fx = x as f32 + 0.5;
-        let fy = y as f32 + 0.5;
-        let dx = fx - cx;
-        let dy = fy - cy;
-        let d2 = dx * dx + dy * dy;
-
-        let vignette = ((dx / (out_w as f32 * 0.7)).powi(2)
-            + (dy / (out_h as f32 * 0.7)).powi(2))
-        .min(1.0);
-        let base = (34.0 - vignette * 10.0).round() as u8;
-        let mut color = [base, base.saturating_add(1), base.saturating_add(4)];
-
-        if d2 <= ring_r2 {
-            color = if d2 >= inner_r2 {
-                [92, 96, 106]
-            } else {
-                [48, 51, 58]
-            };
-            // Centered play triangle shifted slightly right for optical balance.
-            let tx = (dx - ring_r * 0.08) / (ring_r * 0.42);
-            let ty = dy / (ring_r * 0.46);
-            if tx >= -0.65 && tx <= 0.85 && ty.abs() <= (0.85 - tx) * 0.62 {
-                color = [214, 218, 226];
-            }
-        }
-        *px = Rgb(color);
+        let dx = (x as f32 + 0.5) - cx;
+        let dy = (y as f32 + 0.5) - cy;
+        let vignette =
+            ((dx / (out_w as f32 * 0.75)).powi(2) + (dy / (out_h as f32 * 0.75)).powi(2)).min(1.0);
+        let base = (31.0 - vignette * 7.0).round() as u8;
+        *px = Rgb([base, base.saturating_add(1), base.saturating_add(3)]);
     }
 
     DynamicImage::ImageRgb8(img)
@@ -1085,5 +2061,107 @@ mod tests {
         let landscape = render_slate_poster(3840, 2160, 256);
         assert_eq!(landscape.width(), 256);
         assert_eq!(landscape.height(), 144);
+        let rgb = landscape.to_rgb8();
+        let center = rgb.get_pixel(128, 72).0;
+        assert!(
+            center[0] < 48 && center[1] < 48 && center[2] < 48,
+            "slate poster must stay neutral without baked bright play icon pixels: {center:?}"
+        );
+    }
+
+    #[test]
+    fn parses_nikon_ncdt_nctg_metadata_and_extracts_embedded_ncvw_cover() {
+        use image::codecs::jpeg::JpegEncoder;
+
+        let encode_solid_jpeg = |w: u32, h: u32, rgb: [u8; 3]| -> Vec<u8> {
+            let img = RgbImage::from_pixel(w, h, Rgb(rgb));
+            let mut buf = Vec::new();
+            JpegEncoder::new_with_quality(&mut buf, 90)
+                .encode_image(&img)
+                .unwrap();
+            buf
+        };
+
+        let ncth_jpeg = encode_solid_jpeg(80, 45, [20, 180, 40]);
+        let ncvw_jpeg = encode_solid_jpeg(320, 180, [220, 120, 30]);
+
+        let push_nctg_ascii = |out: &mut Vec<u8>, tag: u32, text: &str| {
+            let mut bytes = text.as_bytes().to_vec();
+            bytes.push(0);
+            out.extend_from_slice(&tag.to_be_bytes());
+            out.extend_from_slice(&2_u16.to_be_bytes());
+            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            out.extend_from_slice(&bytes);
+        };
+        let push_nctg_urational = |out: &mut Vec<u8>, tag: u32, num: u32, den: u32| {
+            out.extend_from_slice(&tag.to_be_bytes());
+            out.extend_from_slice(&5_u16.to_be_bytes());
+            out.extend_from_slice(&1_u32.to_be_bytes());
+            out.extend_from_slice(&num.to_be_bytes());
+            out.extend_from_slice(&den.to_be_bytes());
+        };
+        let push_nctg_u16 = |out: &mut Vec<u8>, tag: u32, v: u16| {
+            out.extend_from_slice(&tag.to_be_bytes());
+            out.extend_from_slice(&3_u16.to_be_bytes());
+            out.extend_from_slice(&1_u32.to_be_bytes());
+            out.extend_from_slice(&v.to_be_bytes());
+        };
+
+        let mut nctg_payload = Vec::new();
+        push_nctg_ascii(&mut nctg_payload, 0x0000_0001, "NIKON CORPORATION");
+        push_nctg_ascii(&mut nctg_payload, 0x0000_0002, "NIKON Z 30");
+        push_nctg_ascii(&mut nctg_payload, 0x0000_0003, "Ver.01.11");
+        push_nctg_ascii(&mut nctg_payload, 0x0000_0012, "2026:11:15 14:51:09");
+        push_nctg_urational(&mut nctg_payload, 0x0110_829a, 1, 60);
+        push_nctg_urational(&mut nctg_payload, 0x0110_829d, 45, 10);
+        push_nctg_u16(&mut nctg_payload, 0x0110_8827, 400);
+        push_nctg_urational(&mut nctg_payload, 0x0110_920a, 240, 10);
+        push_nctg_ascii(
+            &mut nctg_payload,
+            0x0110_a434,
+            "NIKKOR Z DX 16-50mm f/3.5-6.3 VR",
+        );
+
+        let ncdt = make_box(
+            b"NCDT",
+            &[
+                make_box(b"NCTG", &nctg_payload),
+                make_box(b"NCTH", &ncth_jpeg),
+                make_box(b"NCVW", &ncvw_jpeg),
+            ]
+            .concat(),
+        );
+        let udta = make_box(b"udta", &ncdt);
+
+        // Reuse base synthetic MOV and append `udta` inside `moov`.
+        let mut mov = build_synthetic_mov(false, None);
+        let moov_pos = mov.windows(4).position(|w| w == b"moov").unwrap() - 4;
+        let old_moov_size =
+            u32::from_be_bytes(mov[moov_pos..moov_pos + 4].try_into().unwrap()) as usize;
+        let new_moov_size = (old_moov_size + udta.len()) as u32;
+        mov[moov_pos..moov_pos + 4].copy_from_slice(&new_moov_size.to_be_bytes());
+        mov.extend_from_slice(&udta);
+
+        let len = mov.len() as u64;
+        let (info, cover, _icc, source) =
+            extract_remote_poster_and_inspect(&mut Cursor::new(&mov), len, "mov", 1024).unwrap();
+        assert_eq!(source, "video_embedded_jpeg");
+        assert_eq!(info.metadata["Make"], "NIKON CORPORATION");
+        assert_eq!(info.metadata["Camera"], "NIKON Z 30");
+        assert_eq!(
+            info.metadata["Lens"],
+            "NIKKOR Z DX 16-50mm f/3.5-6.3 VR"
+        );
+        assert_eq!(info.metadata["Focal Length"], "24 mm");
+        assert_eq!(info.metadata["Aperture"], "f/4.5");
+        assert_eq!(info.metadata["Exposure"], "1/60 s");
+        assert_eq!(info.metadata["ISO"], "400");
+        assert_eq!(info.metadata["Captured"], "2026:11:15 14:51:09");
+        assert_eq!((cover.width(), cover.height()), (320, 180));
+        let px = cover.to_rgb8().get_pixel(160, 90).0;
+        assert!(
+            px[0] > 180 && px[1] > 90 && px[2] < 70,
+            "expected warm orange NCVW preview instead of small green NCTH: {px:?}"
+        );
     }
 }

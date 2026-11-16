@@ -397,10 +397,11 @@ impl Service {
         uncropped: bool,
         prefer_raw: bool,
     ) -> Result<String> {
+        let kind_suffix = if asset.kind == "video" { ":vid2" } else { "" };
         let mode_suffix = if prefer_raw { ":raw" } else { "" };
         if asset.source_key.is_none() {
             return Ok(format!(
-                "preview-v3:{}:{}{mode_suffix}",
+                "preview-v3:{}:{}{kind_suffix}{mode_suffix}",
                 self.core.preview_fingerprint(&asset.id, uncropped)?,
                 tier.as_str()
             ));
@@ -422,7 +423,7 @@ impl Service {
             .and_then(|s| s["size"].as_u64())
             .unwrap_or(asset.size);
         Ok(format!(
-            "preview-v3:{}:{}:{}:{}:{}{mode_suffix}",
+            "preview-v3:{}:{}:{}:{}:{}{kind_suffix}{mode_suffix}",
             asset.id,
             fingerprint,
             size,

@@ -5,7 +5,7 @@
 //! honors track rotation (`appliesPreferredTrackTransform = YES`), and caps the
 //! decoded frame dimensions at `max_side` before converting to `DynamicImage`.
 
-use std::{ffi::c_void, path::Path, ptr};
+use std::{ffi::c_void, io::Write, path::Path, ptr};
 
 use anyhow::{bail, Context, Result};
 use image::DynamicImage;
@@ -128,6 +128,24 @@ pub(crate) fn extract_poster_frame(
 
         bail!("E_UNSUPPORTED_CODEC: AVFoundation could not decode a video frame")
     })
+}
+
+/// Decodes a poster frame from an in-memory self-contained `.mov`/`.mp4` buffer
+/// (such as a bounded 1-sample remote keyframe slice) via an ephemeral temp file
+/// that is unlinked immediately when this call returns.
+pub(crate) fn extract_poster_from_bytes(
+    bytes: &[u8],
+    max_side: u32,
+) -> Result<(DynamicImage, Option<Vec<u8>>)> {
+    let mut tmp = tempfile::Builder::new()
+        .prefix("neb-vframe-")
+        .suffix(".mov")
+        .tempfile()
+        .context("E_IO: Failed to allocate temporary video keyframe buffer")?;
+    tmp.write_all(bytes)
+        .context("E_IO: Failed to write temporary video keyframe buffer")?;
+    tmp.flush()?;
+    extract_poster_frame(tmp.path(), max_side)
 }
 
 #[cfg(test)]

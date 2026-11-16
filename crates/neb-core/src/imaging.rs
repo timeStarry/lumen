@@ -771,8 +771,12 @@ fn video_preview(path: &Path, tier: PreviewTier) -> Result<PreviewImage> {
         let frame = finish_frame(image, "video_frame", 1, None, icc)?;
         return encode_preview_tier(&frame, tier);
     }
+    if let Some((image, icc)) = crate::video::extract_embedded_cover_path(path, tier.pixels()) {
+        let frame = finish_frame(image, "video_embedded_jpeg", 1, None, icc)?;
+        return encode_preview_tier(&frame, tier);
+    }
     let slate = crate::video::render_slate_poster(info.width, info.height, tier.pixels());
-    let frame = finish_frame(slate, "video_poster", 1, None, None)?;
+    let frame = finish_frame(slate, "video_slate", 1, None, None)?;
     encode_preview_tier(&frame, tier)
 }
 
@@ -885,14 +889,14 @@ pub fn remote_preview_bundle<R: Read + Seek>(
 ) -> Result<(PreviewImage, Option<PreviewImage>)> {
     let ext_lower = ext.to_ascii_lowercase();
     if kind(&ext_lower) == Some("video") {
-        let info = crate::video::inspect_reader(input, length, &ext_lower)?;
         let target_max = if tier.is_grid() {
-            PreviewTier::P2560.pixels()
+            PreviewTier::T1024.pixels()
         } else {
             tier.pixels()
         };
-        let slate = crate::video::render_slate_poster(info.width, info.height, target_max);
-        let frame = finish_frame(slate, "video_poster", 1, None, None)?;
+        let (info, cover, icc, source) =
+            crate::video::extract_remote_poster_and_inspect(input, length, &ext_lower, target_max)?;
+        let frame = finish_frame(cover, source, 1, None, icc)?;
         let inspection =
             json!({"width": info.width, "height": info.height, "metadata": info.metadata});
         let mut primary = encode_preview_tier(&frame, tier)?;
@@ -1041,7 +1045,7 @@ pub fn fallback_video_slate(
         tier.pixels()
     };
     let slate = crate::video::render_slate_poster(1920, 1080, target_max);
-    let frame = finish_frame(slate, "video_poster", 1, None, None)?;
+    let frame = finish_frame(slate, "video_slate", 1, None, None)?;
     let primary = encode_preview_tier(&frame, tier)?;
     let companion = if tier.is_grid() {
         Some(encode_preview_tier(&frame, PreviewTier::P2560)?)
@@ -1066,14 +1070,18 @@ pub fn stream_preview_from_bytes(
     if kind(&ext) == Some("video") {
         ensure!(!bytes.is_empty(), "E_UNSUPPORTED_CODEC: Empty video stream");
         let len = bytes.len() as u64;
-        let info = crate::video::inspect_reader(&mut Cursor::new(bytes), len, &ext)?;
         let target_max = if tier.is_grid() {
-            PreviewTier::P2560.pixels()
+            PreviewTier::T1024.pixels()
         } else {
             tier.pixels()
         };
-        let slate = crate::video::render_slate_poster(info.width, info.height, target_max);
-        let frame = finish_frame(slate, "video_poster", 1, None, None)?;
+        let (info, cover, icc, source) = crate::video::extract_remote_poster_and_inspect(
+            &mut Cursor::new(bytes),
+            len,
+            &ext,
+            target_max,
+        )?;
+        let frame = finish_frame(cover, source, 1, None, icc)?;
         let inspection =
             json!({"width": info.width, "height": info.height, "metadata": info.metadata});
         let mut primary = encode_preview_tier(&frame, tier)?;

@@ -17,6 +17,8 @@
 }
 
 .video-stage-player {
+  position: relative;
+  z-index: 1;
   max-width: 100%;
   max-height: 100%;
   width: 100%;
@@ -25,6 +27,23 @@
   outline: none;
   cursor: pointer;
   background: transparent;
+}
+
+.video-stage-cover {
+  position: absolute;
+  top: var(--nl-h-lg);
+  left: 0;
+  right: 0;
+  bottom: 0;
+  width: 100%;
+  height: calc(100% - var(--nl-h-lg));
+  object-fit: contain;
+  pointer-events: none;
+}
+
+.video-stage:fullscreen .video-stage-cover {
+  top: 0;
+  height: 100%;
 }
 
 .video-stage-fallback {
@@ -64,4 +83,3 @@
   opacity: 0.28;
   pointer-events: none;
 }
-

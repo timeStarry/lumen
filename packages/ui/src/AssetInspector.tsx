@@ -20,6 +20,7 @@ import {
   type ColorLabel,
   type Crop,
   type Histogram,
+  type Preview,
 } from './model';
 import { displayDate } from './workspace';
 import { ASPECT_PRESETS, type AspectPreset } from './crop-aspect';
@@ -120,13 +121,26 @@ export default function AssetInspector(props: {
       }
     },
   );
+  const [videoPreview] = createResource(
+    () => (props.asset.kind === 'video' ? imageRequestKey(props.asset) : false),
+    async (key) => {
+      try {
+        return await execute<Preview>('asset.preview', { id: JSON.parse(key).id, tier: 't512' });
+      } catch {
+        return null;
+      }
+    },
+  );
   const inspectedAsset = createMemo(() => {
-    const inspected = !histogram.loading && histogram()?.data?.asset;
+    const fromHist = !histogram.loading && histogram()?.data?.asset;
+    const fromVideo = !videoPreview.loading && videoPreview()?.asset;
+    const inspected = fromHist || fromVideo;
     return inspected && inspected.id === props.asset.id
       ? {
           ...props.asset,
           width: inspected.width,
           height: inspected.height,
+          captured_at: inspected.captured_at || props.asset.captured_at,
           metadata: inspected.metadata,
           size: inspected.size,
           availability: inspected.availability,
@@ -175,7 +189,10 @@ export default function AssetInspector(props: {
       remote_embedded_jpeg: '相机内嵌预览',
       raw_demosaic: 'RAW 基础显影',
       raster: '原图解码',
+      video_frame: '视频首帧解码',
+      video_embedded_jpeg: '相机视频内嵌封面',
       video_poster: '视频海报帧',
+      video_slate: '无内嵌封面',
     })[source] || source.replace(' · 显示 RGB', '');
   const metadataGroups = createMemo(() => inspectorMetadataGroups(inspectedAsset().metadata));
   const hasExif = createMemo(

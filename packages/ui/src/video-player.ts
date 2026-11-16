@@ -1,3 +1,5 @@
+import { formatDurationSeconds, type Asset } from './model';
+
 export const PLAYBACK_RATES = [0.5, 1, 1.5, 2] as const;
 export type PlaybackRate = (typeof PLAYBACK_RATES)[number];
 
@@ -57,4 +59,36 @@ export function toggleStageFullscreen(
   }
   const wkVideo = videoEl as (HTMLVideoElement & { webkitEnterFullscreen?: () => void }) | undefined;
   wkVideo?.webkitEnterFullscreen?.();
+}
+
+export function clampSeekTime(
+  seconds: number,
+  elDuration: number,
+  fallbackDuration: number,
+): number {
+  const max = Number.isFinite(elDuration) && elDuration > 0 ? elDuration : fallbackDuration;
+  return Math.max(0, Math.min(max || 0, seconds));
+}
+
+export function syncVideoDimensionsAndDuration(
+  current: Asset,
+  videoWidth: number,
+  videoHeight: number,
+  rawDuration: number,
+): Asset | null {
+  const vw = videoWidth || current.width;
+  const vh = videoHeight || current.height;
+  const dur =
+    !current.metadata?.Duration && Number.isFinite(rawDuration) && rawDuration > 0
+      ? formatDurationSeconds(rawDuration)
+      : current.metadata?.Duration;
+  if (vw === current.width && vh === current.height && dur === current.metadata?.Duration) {
+    return null;
+  }
+  return {
+    ...current,
+    width: vw,
+    height: vh,
+    metadata: dur ? { ...current.metadata, Duration: dur } : current.metadata,
+  };
 }

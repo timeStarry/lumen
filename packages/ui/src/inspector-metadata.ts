@@ -82,10 +82,13 @@ export function exposureParameters(metadata: Metadata): InspectorParameter[] {
   return exposureFields.map((field) => parameter(metadata, field));
 }
 
+const internalKeys = new Set(['Duration Seconds', 'Media Type', 'Capture Subsecond']);
+
 export function inspectorMetadataGroups(metadata: Metadata) {
   const knownKeys = new Set([
     ...exposureFields.flatMap((field) => field.aliases),
     ...groupFields.flatMap((group) => group.fields.flatMap((field) => field.aliases)),
+    ...internalKeys,
   ]);
   const groups = groupFields.map((group) => ({
     title: group.title,

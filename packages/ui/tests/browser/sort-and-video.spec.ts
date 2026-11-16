@@ -126,15 +126,46 @@ test('default library sort preference and video format filtering & stage', async
   const videoEl = page.locator('.viewer-overlay video.video-stage-player');
   await expect(videoEl).toBeVisible();
   await expect(videoEl).not.toHaveAttribute('controls');
+  await expect(videoEl).not.toHaveAttribute('poster');
+
+  // Crisp vector center play button appears before first play, then hides once played/paused.
+  const heroPlay = page.locator('.viewer-overlay button.nl-video-hero-play');
+  await expect(heroPlay).toBeVisible();
+  await heroPlay.click();
+  await expect(heroPlay).toHaveCount(0);
+  await page.keyboard.press(' ');
+  await expect.poll(() => videoEl.evaluate((el: HTMLVideoElement) => el.paused)).toBe(true);
+  await expect(heroPlay).toHaveCount(0);
+  await expect(videoEl).toBeVisible();
 
   const videoBar = page.locator('.viewer-overlay').getByRole('region', { name: '视频播放控制' });
   await expect(videoBar).toBeVisible();
+
+  // Verify both timeline & volume scrubber thumbs are centered on their 4px rails (< 0.5px offset).
+  for (const scrubberSel of ['.nl-video-timeline', '.nl-video-vol-wrap']) {
+    const deltaY = await videoBar.locator(scrubberSel).evaluate((root) => {
+      const rail = root.querySelector('.nl-scrubber-rail')!.getBoundingClientRect();
+      const thumb = root.querySelector('.nl-scrubber-thumb')!.getBoundingClientRect();
+      return Math.abs(rail.top + rail.height / 2 - (thumb.top + thumb.height / 2));
+    });
+    expect(deltaY).toBeLessThan(0.5);
+  }
+
   await expect(videoBar.getByRole('button', { name: /播放倍速：当前 1 倍/ })).toBeVisible();
   await videoBar.getByRole('button', { name: /播放倍速：当前 1 倍/ }).click();
   await expect(videoBar.getByRole('button', { name: /播放倍速：当前 1\.5 倍/ })).toBeVisible();
 
   await page.keyboard.press('m');
   await expect(videoBar.getByRole('button', { name: /取消静音（M）/ })).toBeVisible();
+
+  // Open Inspector (`i`) on the video clip: unrecorded pinned photo fields (`—`) and internal keys are omitted.
+  await page.keyboard.press('i');
+  const shootingPanel = page.locator('.viewer-overlay .shooting-parameters');
+  await expect(shootingPanel).toBeVisible();
+  await expect(shootingPanel).not.toContainText('—');
+  await expect(shootingPanel).not.toContainText('Duration Seconds');
+  await expect(shootingPanel).not.toContainText('Media Type');
+  await page.keyboard.press('i');
 
   const videoTlTop = await page
     .locator('.viewer-overlay .nl-overlay-corner--tl')

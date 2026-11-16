@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 const MAX_HEADER_BYTES: usize = 8192;
 const STREAM_BUF_BYTES: usize = 64 * 1024;
-const MAX_CONCURRENT_STREAMS: usize = 32;
+const MAX_CONCURRENT_STREAMS: usize = 64;
 const MAX_ID_LEN: usize = 64;
 const APP_ORIGINS: [&str; 2] = ["tauri://localhost", "http://tauri.localhost"];
 
@@ -412,12 +412,14 @@ fn handle_connection(mut stream: TcpStream, service: &Service, expected_token: &
         media.total_len
     };
 
+    let etag = format!("\"{id}-{rev}-{}\"", media.total_len);
     let mut header_block = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nCache-Control: no-store\r\nAccess-Control-Expose-Headers: Accept-Ranges, Content-Range, Content-Length\r\nConnection: close\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nETag: {}\r\nCache-Control: private, max-age=3600\r\nAccess-Control-Expose-Headers: Accept-Ranges, Content-Range, Content-Length, ETag\r\nConnection: close\r\n",
         status.as_u16(),
         status_reason(status),
         media.content_type,
-        content_len
+        content_len,
+        etag
     );
     if media.partial {
         header_block.push_str(&format!(
