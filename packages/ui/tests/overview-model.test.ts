@@ -8,6 +8,8 @@ import {
   granularityLabel,
   librarySourceBadge,
   pickRatePercent,
+  resolveOverviewPick,
+  shouldClearExtraOnManualFilter,
   statsBinItems,
   summarizeLibraries,
 } from '../src/overview-model';
@@ -246,5 +248,62 @@ describe('overview-model formatting & funnel helpers', () => {
       remote: 1,
       totalPhotos: 5400,
     });
+  });
+
+  it('maps single-field overview picks to first-class filters and resolves compound pick conflicts', () => {
+    expect(resolveOverviewPick({ label: '留用', options: { flag: 'pick' } })).toEqual({
+      flag: 'pick',
+      extra: undefined,
+    });
+    expect(
+      resolveOverviewPick(
+        { label: '淘汰', options: { flag: 'reject' } },
+        { label: '未处理', options: { flag: 'none', rating_max: 0 } },
+      ),
+    ).toEqual({
+      flag: 'reject',
+      extra: null,
+    });
+    expect(
+      resolveOverviewPick(
+        { label: '留用', options: { flag: 'pick' } },
+        { label: '焦距 35–50 mm', options: { focal_min: 35, focal_max: 50 } },
+      ),
+    ).toEqual({
+      flag: 'pick',
+      extra: undefined,
+    });
+    expect(resolveOverviewPick({ label: 'NIKON Z 30', options: { camera: 'NIKON Z 30' } })).toEqual(
+      { camera: 'NIKON Z 30' },
+    );
+    expect(
+      resolveOverviewPick({
+        label: 'NIKKOR Z DX 50-250mm',
+        options: { lens: 'NIKKOR Z DX 50-250mm' },
+      }),
+    ).toEqual({ lens: 'NIKKOR Z DX 50-250mm' });
+    expect(
+      resolveOverviewPick({
+        label: '2026-11-02',
+        options: { captured_from: '2026-11-02', captured_to: '2026-11-02' },
+      }),
+    ).toEqual({
+      capturedFrom: '2026-11-02',
+      capturedTo: '2026-11-02',
+    });
+
+    const unprocessed = { label: '未处理', options: { flag: 'none' as const, rating_max: 0 } };
+    expect(resolveOverviewPick(unprocessed)).toEqual({
+      flag: 'any',
+      rating: 0,
+      extra: unprocessed,
+    });
+    expect(shouldClearExtraOnManualFilter(unprocessed, 'flag')).toBe(true);
+    expect(shouldClearExtraOnManualFilter(unprocessed, 'rating')).toBe(true);
+
+    const focal = { label: '焦距 24–35 mm', options: { focal_min: 24, focal_max: 35 } };
+    expect(resolveOverviewPick(focal)).toEqual({ extra: focal });
+    expect(shouldClearExtraOnManualFilter(focal, 'flag')).toBe(false);
+    expect(shouldClearExtraOnManualFilter(focal, 'rating')).toBe(false);
   });
 });

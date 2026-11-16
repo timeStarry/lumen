@@ -20,6 +20,7 @@ import {
   type ColorLabel,
   type Crop,
   type Histogram,
+  type Preview,
 } from './model';
 import { displayDate } from './workspace';
 import { ASPECT_PRESETS, type AspectPreset } from './crop-aspect';
@@ -108,7 +109,7 @@ export default function AssetInspector(props: {
     }
   }
   const [histogram] = createResource(
-    () => imageRequestKey(props.asset),
+    () => (props.asset.kind === 'video' ? false : imageRequestKey(props.asset)),
     async (key) => {
       try {
         return {
@@ -120,13 +121,26 @@ export default function AssetInspector(props: {
       }
     },
   );
+  const [videoPreview] = createResource(
+    () => (props.asset.kind === 'video' ? imageRequestKey(props.asset) : false),
+    async (key) => {
+      try {
+        return await execute<Preview>('asset.preview', { id: JSON.parse(key).id, tier: 't512' });
+      } catch {
+        return null;
+      }
+    },
+  );
   const inspectedAsset = createMemo(() => {
-    const inspected = !histogram.loading && histogram()?.data?.asset;
+    const fromHist = !histogram.loading && histogram()?.data?.asset;
+    const fromVideo = !videoPreview.loading && videoPreview()?.asset;
+    const inspected = fromHist || fromVideo;
     return inspected && inspected.id === props.asset.id
       ? {
           ...props.asset,
           width: inspected.width,
           height: inspected.height,
+          captured_at: inspected.captured_at || props.asset.captured_at,
           metadata: inspected.metadata,
           size: inspected.size,
           availability: inspected.availability,
@@ -175,6 +189,10 @@ export default function AssetInspector(props: {
       remote_embedded_jpeg: '相机内嵌预览',
       raw_demosaic: 'RAW 基础显影',
       raster: '原图解码',
+      video_frame: '视频首帧解码',
+      video_embedded_jpeg: '相机视频内嵌封面',
+      video_poster: '视频海报帧',
+      video_slate: '无内嵌封面',
     })[source] || source.replace(' · 显示 RGB', '');
   const metadataGroups = createMemo(() => inspectorMetadataGroups(inspectedAsset().metadata));
   const hasExif = createMemo(
@@ -341,58 +359,60 @@ export default function AssetInspector(props: {
           </div>
         </section>
       </Show>
-      <section class="inspector-section">
-        <div class="section-title">
-          <h3>直方图</h3>
-          <span>RGB</span>
-        </div>
-        <div class="histogram" aria-busy={histogram.loading}>
-          <Show
-            when={histogram()?.data && !histogram.loading}
-            fallback={
-              <div class="histogram-empty" role="status">
-                {histogram.loading ? '正在计算像素分布…' : '直方图不可用'}
-              </div>
-            }
-          >
-            <svg
-              viewBox="0 0 255 80"
-              preserveAspectRatio="none"
-              role="img"
-              aria-label="当前图片 RGB 直方图"
+      <Show when={props.asset.kind !== 'video'}>
+        <section class="inspector-section">
+          <div class="section-title">
+            <h3>直方图</h3>
+            <span>RGB</span>
+          </div>
+          <div class="histogram" aria-busy={histogram.loading}>
+            <Show
+              when={histogram()?.data && !histogram.loading}
+              fallback={
+                <div class="histogram-empty" role="status">
+                  {histogram.loading ? '正在计算像素分布…' : '直方图不可用'}
+                </div>
+              }
             >
-              <path class="hist-red" d={histogramPath(histogram()!.data!.red, ceiling())} />
-              <path class="hist-green" d={histogramPath(histogram()!.data!.green, ceiling())} />
-              <path class="hist-blue" d={histogramPath(histogram()!.data!.blue, ceiling())} />
-            </svg>
+              <svg
+                viewBox="0 0 255 80"
+                preserveAspectRatio="none"
+                role="img"
+                aria-label="当前图片 RGB 直方图"
+              >
+                <path class="hist-red" d={histogramPath(histogram()!.data!.red, ceiling())} />
+                <path class="hist-green" d={histogramPath(histogram()!.data!.green, ceiling())} />
+                <path class="hist-blue" d={histogramPath(histogram()!.data!.blue, ceiling())} />
+              </svg>
+            </Show>
+          </div>
+          <div class="histogram-axis">
+            <span>0</span>
+            <i />
+            <span>255</span>
+          </div>
+          <dl class="exposure-summary" aria-label="曝光参数">
+            <For each={exposure()}>
+              {(field) => (
+                <div classList={{ 'is-missing': field.value === null }}>
+                  <dt>{field.label}</dt>
+                  <dd
+                    title={field.value || '未记录'}
+                    aria-label={field.value === null ? `${field.label}未记录` : undefined}
+                  >
+                    {field.value || '—'}
+                  </dd>
+                </div>
+              )}
+            </For>
+          </dl>
+          <Show when={sourceRestriction() || histogramError()}>
+            <p class="histogram-source" classList={{ 'is-error': !!histogramError() }}>
+              {histogramError() || sourceRestriction()}
+            </p>
           </Show>
-        </div>
-        <div class="histogram-axis">
-          <span>0</span>
-          <i />
-          <span>255</span>
-        </div>
-        <dl class="exposure-summary" aria-label="曝光参数">
-          <For each={exposure()}>
-            {(field) => (
-              <div classList={{ 'is-missing': field.value === null }}>
-                <dt>{field.label}</dt>
-                <dd
-                  title={field.value || '未记录'}
-                  aria-label={field.value === null ? `${field.label}未记录` : undefined}
-                >
-                  {field.value || '—'}
-                </dd>
-              </div>
-            )}
-          </For>
-        </dl>
-        <Show when={sourceRestriction() || histogramError()}>
-          <p class="histogram-source" classList={{ 'is-error': !!histogramError() }}>
-            {histogramError() || sourceRestriction()}
-          </p>
-        </Show>
-      </section>
+        </section>
+      </Show>
       <KeywordSection
         asset={inspectedAsset()}
         disabled={props.busy}
@@ -401,7 +421,11 @@ export default function AssetInspector(props: {
       <PinnedFields asset={inspectedAsset()} />
       <section class="inspector-section inspector-raw">
         <Show when={!hasExif()}>
-          <p class="metadata-empty">此文件未提供可读取的 EXIF 信息。</p>
+          <p class="metadata-empty">
+            {props.asset.kind === 'video'
+              ? '此视频未包含可读取的拍摄元数据。'
+              : '此文件未提供可读取的 EXIF 信息。'}
+          </p>
         </Show>
         <Show when={Object.keys(inspectedAsset().metadata).some((key) => key.startsWith('EXIF '))}>
           <details class="exif-details exif-fields">

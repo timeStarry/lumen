@@ -33,7 +33,7 @@ pub enum DateLayout {
 #[serde(rename_all = "snake_case")]
 pub enum TypeSplit {
     None,
-    /// RAW / JPG / TIFF / OTHER inside the date folder. XMP follows its RAW.
+    /// RAW / JPG / TIFF / VIDEO / OTHER inside the date folder. XMP follows its primary asset.
     ByKind,
 }
 
@@ -75,6 +75,9 @@ pub struct OrganizeRules {
     pub rename_mode: RenameMode,
     #[serde(default)]
     pub rename_prefix: String,
+    /// Whether video formats (`mp4`, `mov`, `mts`, etc.) are included when scanning the source.
+    #[serde(default = "default_include_videos")]
+    pub include_videos: bool,
 }
 
 fn default_layout() -> DateLayout {
@@ -85,6 +88,9 @@ fn default_split() -> TypeSplit {
 }
 fn default_unknown() -> UnknownDate {
     UnknownDate::Folder
+}
+fn default_include_videos() -> bool {
+    true
 }
 
 impl Default for OrganizeRules {
@@ -97,6 +103,7 @@ impl Default for OrganizeRules {
             subfolder: String::new(),
             rename_mode: RenameMode::Keep,
             rename_prefix: String::new(),
+            include_videos: true,
         }
     }
 }
@@ -271,6 +278,7 @@ pub fn kind_folder(key: &str) -> &'static str {
     match extension.as_str() {
         "jpg" | "jpeg" => "JPG",
         "tif" | "tiff" => "TIFF",
+        "mov" | "mp4" | "m4v" | "webm" | "3gp" | "avi" | "mkv" | "mts" | "m2ts" => "VIDEO",
         "dng" | "nef" | "nrw" | "cr2" | "cr3" | "arw" | "srf" | "sr2" | "raf" | "orf" | "rw2"
         | "pef" | "srw" | "3fr" | "fff" | "iiq" | "rwl" | "x3f" | "raw" | "xmp" => "RAW",
         _ => "OTHER",
@@ -330,7 +338,11 @@ mod tests {
         );
         assert_eq!(
             target_path(&rules, "DCIM/clip.MOV", &date(None)).unwrap(),
-            "Camera/Z8/unknown-date/OTHER/clip.MOV"
+            "Camera/Z8/unknown-date/VIDEO/clip.MOV"
+        );
+        assert_eq!(
+            target_path(&rules, "DCIM/graphic.PNG", &date(None)).unwrap(),
+            "Camera/Z8/unknown-date/OTHER/graphic.PNG"
         );
         let preserve = OrganizeRules::from_legacy_layout("preserve").unwrap();
         assert_eq!(

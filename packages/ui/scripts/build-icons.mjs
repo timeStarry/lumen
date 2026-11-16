@@ -26,6 +26,7 @@ const aliases = {
 };
 
 const tabler = [
+  'adjustments-horizontal',
   'alert-circle',
   'alert-triangle',
   'app-window',
@@ -76,6 +77,7 @@ const tabler = [
   'photo-plus',
   'pin',
   'pinned-off',
+  'player-pause',
   'player-play',
   'plus',
   'refresh',
@@ -90,6 +92,8 @@ const tabler = [
   'trash',
   'upload',
   'usb',
+  'volume',
+  'volume-off',
   'world',
   'x',
   'zoom-in',

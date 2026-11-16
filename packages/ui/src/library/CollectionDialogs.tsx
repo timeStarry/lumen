@@ -29,7 +29,7 @@ export function CollectionEditorDialog(props: {
   const [colorLabel, setColorLabel] = createSignal<ColorLabelFilter>(
     props.existing?.rules?.color_label ?? 'any',
   );
-  const [format, setFormat] = createSignal<'all' | 'raw' | 'jpeg'>(
+  const [format, setFormat] = createSignal<NonNullable<SmartCollectionRules['format']>>(
     props.existing?.rules?.format ?? 'all',
   );
   const [camera, setCamera] = createSignal(props.existing?.rules?.camera ?? '');
@@ -192,11 +192,15 @@ export function CollectionEditorDialog(props: {
                   id={id}
                   size="sm"
                   value={format()}
-                  onChange={(v) => setFormat(v as 'all' | 'raw' | 'jpeg')}
+                  onChange={(v) =>
+                    setFormat(v as NonNullable<SmartCollectionRules['format']>)
+                  }
                   options={[
                     { value: 'all', label: '全部格式' },
+                    { value: 'photo', label: '仅照片' },
                     { value: 'raw', label: '仅 RAW' },
                     { value: 'jpeg', label: '仅 JPEG' },
+                    { value: 'video', label: '视频' },
                   ]}
                 />
               )}

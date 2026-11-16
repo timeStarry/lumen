@@ -40,3 +40,4 @@ export { toasts } from './toasts';
 export type { ToastInput } from './toasts';
 export { createHud, HUD_MS } from './Hud';
 export type { Hud } from './Hud';
+export { default as VideoControls, VideoHeroPlay } from './VideoControls';

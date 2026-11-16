@@ -18,6 +18,7 @@ use crate::{Crop, PreviewImage, PreviewTier};
 pub const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_PIXELS: u64 = 120_000_000;
 
+#[derive(Debug)]
 pub struct Inspection {
     pub width: u32,
     pub height: u32,
@@ -31,6 +32,7 @@ pub fn kind(extension: &str) -> Option<&'static str> {
         "dng" | "cr2" | "cr3" | "nef" | "nrw" | "arw" | "srf" | "sr2" | "raf" | "orf" | "rw2"
         | "rwl" | "pef" | "srw" | "raw" | "3fr" | "fff" | "iiq" | "kdc" | "dcr" | "mos" | "mef"
         | "erf" | "x3f" => Some("raw"),
+        "mp4" | "mov" | "m4v" | "webm" | "avi" | "mkv" | "mts" | "m2ts" | "3gp" => Some("video"),
         _ => None,
     }
 }
@@ -213,13 +215,16 @@ fn format_exif_field(field: &exif::Field, exif: &exif::Exif, limit: usize) -> Op
 }
 
 pub fn inspect(path: &Path) -> Result<Inspection> {
+    let extension = extension(path);
+    if kind(&extension) == Some("video") {
+        return crate::video::inspect_path(path);
+    }
     check_file(path)?;
     let parsed_exif = read_parsed_exif(path);
     let adobe_rgb = parsed_exif
         .as_ref()
         .is_some_and(crate::icc::is_adobe_rgb_exif);
     let mut metadata = parsed_exif.as_ref().map(exif_metadata).unwrap_or_default();
-    let extension = extension(path);
     metadata.insert("Format".into(), extension.to_ascii_uppercase());
     if adobe_rgb {
         metadata
@@ -746,6 +751,9 @@ pub fn preview_with_options(
     tier: PreviewTier,
     prefer_raw: bool,
 ) -> Result<PreviewImage> {
+    if kind(&extension(path)) == Some("video") {
+        return video_preview(path, tier);
+    }
     let frame = render_frame(
         path,
         crop,
@@ -753,6 +761,22 @@ pub fn preview_with_options(
         !prefer_raw && tier.prefers_embedded(),
         prefer_raw,
     )?;
+    encode_preview_tier(&frame, tier)
+}
+
+fn video_preview(path: &Path, tier: PreviewTier) -> Result<PreviewImage> {
+    let info = crate::video::inspect_path(path)?;
+    #[cfg(target_os = "macos")]
+    if let Ok((image, icc)) = crate::macos_video::extract_poster_frame(path, tier.pixels()) {
+        let frame = finish_frame(image, "video_frame", 1, None, icc)?;
+        return encode_preview_tier(&frame, tier);
+    }
+    if let Some((image, icc)) = crate::video::extract_embedded_cover_path(path, tier.pixels()) {
+        let frame = finish_frame(image, "video_embedded_jpeg", 1, None, icc)?;
+        return encode_preview_tier(&frame, tier);
+    }
+    let slate = crate::video::render_slate_poster(info.width, info.height, tier.pixels());
+    let frame = finish_frame(slate, "video_slate", 1, None, None)?;
     encode_preview_tier(&frame, tier)
 }
 
@@ -864,6 +888,30 @@ pub fn remote_preview_bundle<R: Read + Seek>(
     tier: PreviewTier,
 ) -> Result<(PreviewImage, Option<PreviewImage>)> {
     let ext_lower = ext.to_ascii_lowercase();
+    if kind(&ext_lower) == Some("video") {
+        let target_max = if tier.is_grid() {
+            PreviewTier::T1024.pixels()
+        } else {
+            tier.pixels()
+        };
+        let (info, cover, icc, source) =
+            crate::video::extract_remote_poster_and_inspect(input, length, &ext_lower, target_max)?;
+        let frame = finish_frame(cover, source, 1, None, icc)?;
+        let inspection =
+            json!({"width": info.width, "height": info.height, "metadata": info.metadata});
+        let mut primary = encode_preview_tier(&frame, tier)?;
+        primary
+            .extras
+            .insert("inspection".into(), inspection.clone());
+        let companion = if tier.is_grid() {
+            let mut p2560 = encode_preview_tier(&frame, PreviewTier::P2560)?;
+            p2560.extras.insert("inspection".into(), inspection);
+            Some(p2560)
+        } else {
+            None
+        };
+        return Ok((primary, companion));
+    }
     if matches!(ext_lower.as_str(), "jpg" | "jpeg") {
         let jpg = crate::jpeg_range::read_jpeg_range_preview(input, length, tier)?;
         let mut metadata = jpg
@@ -983,6 +1031,30 @@ fn read_parsed_exif_bytes(bytes: &[u8], ext: &str) -> Option<exif::Exif> {
         .ok()
 }
 
+/// Neutral poster frame for remote videos when the server lacks HTTP Range
+/// support or manual download mode forbids pulling large video originals.
+/// Never fabricates unknown dimensions or metadata in the catalog.
+pub fn fallback_video_slate(
+    ext: &str,
+    tier: PreviewTier,
+) -> Result<(PreviewImage, Option<PreviewImage>)> {
+    let _ = ext;
+    let target_max = if tier.is_grid() {
+        PreviewTier::P2560.pixels()
+    } else {
+        tier.pixels()
+    };
+    let slate = crate::video::render_slate_poster(1920, 1080, target_max);
+    let frame = finish_frame(slate, "video_slate", 1, None, None)?;
+    let primary = encode_preview_tier(&frame, tier)?;
+    let companion = if tier.is_grid() {
+        Some(encode_preview_tier(&frame, PreviewTier::P2560)?)
+    } else {
+        None
+    };
+    Ok((primary, companion))
+}
+
 /// Pure in-memory decode & inspection for streamed remote files (`stream_preview`
 /// and `memory_only` modes). Never writes temporary or original files to disk.
 /// When `tier.is_grid()` and `!prefer_raw`, decodes at viewer resolution so both
@@ -994,11 +1066,41 @@ pub fn stream_preview_from_bytes(
     tier: PreviewTier,
     prefer_raw: bool,
 ) -> Result<(PreviewImage, Option<PreviewImage>)> {
+    let ext = ext.to_ascii_lowercase();
+    if kind(&ext) == Some("video") {
+        ensure!(!bytes.is_empty(), "E_UNSUPPORTED_CODEC: Empty video stream");
+        let len = bytes.len() as u64;
+        let target_max = if tier.is_grid() {
+            PreviewTier::T1024.pixels()
+        } else {
+            tier.pixels()
+        };
+        let (info, cover, icc, source) = crate::video::extract_remote_poster_and_inspect(
+            &mut Cursor::new(bytes),
+            len,
+            &ext,
+            target_max,
+        )?;
+        let frame = finish_frame(cover, source, 1, None, icc)?;
+        let inspection =
+            json!({"width": info.width, "height": info.height, "metadata": info.metadata});
+        let mut primary = encode_preview_tier(&frame, tier)?;
+        primary
+            .extras
+            .insert("inspection".into(), inspection.clone());
+        let companion = if tier.is_grid() {
+            let mut p2560 = encode_preview_tier(&frame, PreviewTier::P2560)?;
+            p2560.extras.insert("inspection".into(), inspection);
+            Some(p2560)
+        } else {
+            None
+        };
+        return Ok((primary, companion));
+    }
     ensure!(
         !bytes.is_empty() && u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= MAX_FILE_BYTES,
         "E_LIMIT: Streamed image exceeds the 512 MiB decode limit"
     );
-    let ext = ext.to_ascii_lowercase();
     let parsed_exif = read_parsed_exif_bytes(bytes, &ext);
     let adobe_rgb = parsed_exif
         .as_ref()

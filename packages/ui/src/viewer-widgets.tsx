@@ -171,8 +171,10 @@ export const WIDGETS: readonly WidgetDef[] = [
     name: '直方图',
     group: '其他',
     needsHistogram: true,
-    render: (_asset, context) =>
-      context.histogram ? <HistogramMark histogram={context.histogram} /> : null,
+    render: (asset, context) =>
+      asset.kind !== 'video' && context.histogram ? (
+        <HistogramMark histogram={context.histogram} />
+      ) : null,
   },
   {
     id: 'dimensions',

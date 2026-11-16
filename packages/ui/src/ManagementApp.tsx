@@ -63,7 +63,11 @@ import {
 import type { MenuEntry } from './ui';
 import './library/library.css';
 import './library/wall.css';
-import LibraryOverview from './LibraryOverview';
+import LibraryOverview, { type OverviewPick } from './LibraryOverview';
+import {
+  resolveOverviewPick,
+  shouldClearExtraOnManualFilter,
+} from './overview-model';
 import {
   exportOriginals,
   exportPhotos,
@@ -84,7 +88,6 @@ import ImportWorkspace from './ImportWorkspace';
 import Viewer, { type CullQueue, type ViewerMode } from './Viewer';
 import Icon from './Icon';
 import Settings from './SettingsWorkspace';
-import CaptureIndexControl from './CaptureIndexControl';
 import OverflowMenu from './OverflowMenu';
 import ContextMenu, { type ContextMenuState } from './ContextMenu';
 import JustifiedGrid, { type JustifiedGridApi } from './JustifiedGrid';
@@ -93,6 +96,16 @@ import CommandPalette from './CommandPalette';
 import type { CommandAction } from './command-palette';
 import { CollectionEditorDialog, CollectionPickerDialog } from './library/CollectionDialogs';
 import LibraryFilterBar from './library/LibraryFilterBar';
+import LibraryViewOptions, {
+  SORT_OPTIONS,
+  sortSelectTitle,
+} from './library/LibraryViewOptions';
+import {
+  DEFAULT_SORT_CHANGED_EVENT,
+  DEFAULT_THUMB_SIZE,
+  readDefaultLibrarySort,
+  type LibrarySortPreference,
+} from './sort-preferences';
 import DateScrubber from './wall/DateScrubber';
 import { fitRect, fly } from './zoom-transition';
 import { createFeedback, FeedbackStack } from './feedback';
@@ -161,9 +174,14 @@ export default function ManagementApp() {
   }
   const [total, setTotal] = createSignal(0);
   const [fileTotal, setFileTotal] = createSignal<number>();
-  const [sort, setSort] = createSignal<NonNullable<AssetListOptions['sort_by']>>('captured_at');
-  const [direction, setDirection] =
-    createSignal<NonNullable<AssetListOptions['sort_direction']>>('desc');
+  const initialSort = readDefaultLibrarySort();
+  const [defaultSort, setDefaultSort] = createSignal<LibrarySortPreference>(initialSort);
+  const [sort, setSort] = createSignal<NonNullable<AssetListOptions['sort_by']>>(
+    initialSort.sortBy,
+  );
+  const [direction, setDirection] = createSignal<NonNullable<AssetListOptions['sort_direction']>>(
+    initialSort.direction,
+  );
   const [burstStacks, setBurstStacks] = createSignal(readBurstStacks());
   const [expandedStacks, setExpandedStacks] = createSignal<ReadonlySet<string>>(new Set());
   function toggleBurstStacks(next?: boolean) {
@@ -231,8 +249,27 @@ export default function ManagementApp() {
   const [capturedTo, setCapturedTo] = createSignal('');
   // Library-relative folder chosen in the sidebar tree; '' is the whole library.
   const [folder, setFolder] = createSignal('');
-  // A filter picked from an overview chart, shown as one removable chip.
-  const [extra, setExtra] = createSignal<{ label: string; options: Partial<AssetListOptions> }>();
+  // A compound/range filter picked from an overview chart, shown as one removable chip.
+  const [extra, setExtra] = createSignal<OverviewPick>();
+  const [captureStatuses, setCaptureStatuses] = createSignal<
+    Readonly<Record<string, CaptureIndexStatus>>
+  >({});
+  const [captureIndexRev, setCaptureIndexRev] = createSignal(0);
+  const [toolbarWidth, setToolbarWidth] = createSignal(1200);
+  const toolbarDensity = createMemo<'wide' | 'medium' | 'narrow'>(() =>
+    toolbarWidth() >= 920 ? 'wide' : toolbarWidth() >= 620 ? 'medium' : 'narrow',
+  );
+  let toolbarObserver: ResizeObserver | undefined;
+  function bindLibraryToolbar(el: HTMLDivElement) {
+    toolbarObserver?.disconnect();
+    if (el.clientWidth > 0) setToolbarWidth(el.clientWidth);
+    if (typeof ResizeObserver !== 'undefined') {
+      toolbarObserver = new ResizeObserver(() => {
+        if (el.clientWidth > 0) setToolbarWidth(el.clientWidth);
+      });
+      toolbarObserver.observe(el);
+    }
+  }
   const [folders, setFolders] = createSignal<LibraryFolders>();
   // 照片 shows the grid, 概览 the statistics for the same filter; 选片 opens culling.
   const [view, setView] = createSignal<'photos' | 'overview'>('photos');
@@ -625,6 +662,10 @@ export default function ManagementApp() {
       /* Only affects which library opens next time. */
     }
     request++;
+    const preferredSort = readDefaultLibrarySort();
+    setDefaultSort(preferredSort);
+    setSort(preferredSort.sortBy);
+    setDirection(preferredSort.direction);
     setAssets([]);
     setTotal(0);
     selection.reset(undefined);
@@ -650,10 +691,12 @@ export default function ManagementApp() {
     void refreshLibraryKeywords(library.id);
     setInfo(false);
     setLibraryId(library.id);
-    if (desktop)
+    if (desktop) {
+      void probeCaptureIndexStatus(library);
       void execute<ImportBatch[]>('import.batches', { library_id: library.id })
         .then((items) => libraryId() === library.id && setBatches(items))
         .catch(() => undefined);
+    }
     setSection('libraries');
     setError('');
     setNotice('');
@@ -673,6 +716,12 @@ export default function ManagementApp() {
     reject: '淘汰',
     not_reject: '隐藏淘汰',
   };
+  const FORMAT_LABELS: Record<string, string> = {
+    photo: '仅照片',
+    video: '视频',
+    raw: 'RAW',
+    jpeg: 'JPEG',
+  };
   /** Active filters as removable chips, so a closed panel never hides what is applied. */
   const activeFilters = createMemo(() => {
     const chips: { label: string; clear: () => void }[] = [];
@@ -686,7 +735,10 @@ export default function ManagementApp() {
         clear: () => setColorLabel('any'),
       });
     if (format() !== 'all')
-      chips.push({ label: format().toUpperCase(), clear: () => setFormat('all') });
+      chips.push({
+        label: FORMAT_LABELS[format()] || format().toUpperCase(),
+        clear: () => setFormat('all'),
+      });
     if (camera()) chips.push({ label: camera(), clear: () => setCamera('') });
     if (lens()) chips.push({ label: lens(), clear: () => setLens('') });
     if (keyword())
@@ -704,6 +756,25 @@ export default function ManagementApp() {
     if (picked) chips.push({ label: picked.label, clear: () => setExtra(undefined) });
     return chips;
   });
+  function chooseRating(next: number) {
+    if (shouldClearExtraOnManualFilter(extra(), 'rating')) setExtra(undefined);
+    setRating(next);
+  }
+  function chooseFlag(next: FlagFilter) {
+    if (shouldClearExtraOnManualFilter(extra(), 'flag')) setExtra(undefined);
+    setFlag(next);
+  }
+  function applyOverviewPick(pick: OverviewPick) {
+    const patch = resolveOverviewPick(pick, extra());
+    if (patch.flag !== undefined) setFlag(patch.flag);
+    if (patch.rating !== undefined) setRating(patch.rating);
+    if (patch.camera !== undefined) setCamera(patch.camera);
+    if (patch.lens !== undefined) setLens(patch.lens);
+    if (patch.capturedFrom !== undefined) setCapturedFrom(patch.capturedFrom);
+    if (patch.capturedTo !== undefined) setCapturedTo(patch.capturedTo);
+    if (patch.extra === null) setExtra(undefined);
+    else if (patch.extra !== undefined) setExtra(patch.extra);
+  }
   function clearAllFilters() {
     setRating(0);
     setFlag('any');
@@ -1036,29 +1107,118 @@ export default function ManagementApp() {
     { taskId: string; libraryName: string; timer?: ReturnType<typeof setTimeout> }
   >();
 
-  function syncCaptureIndexTask(library: Library, status: CaptureIndexStatus) {
+  function captureIndexSummaryText(status: CaptureIndexStatus): string {
+    const failed = status.job?.failed ? ` · 本次失败 ${status.job.failed}` : '';
+    return `已知 ${status.known} · 未获得 ${status.missing} · 待索引 ${status.pending}${failed}`;
+  }
+
+  function captureIndexMenuTitle(status?: CaptureIndexStatus): string {
+    if (!status) return '按需读取拍摄信息，不增加原图缓存。';
+    const prefix =
+      (status.job?.failed || status.job?.status === 'failed') && status.pending > 0
+        ? '上次未完成，点击重试剩余待索引照片。'
+        : '按需读取拍摄信息，不增加原图缓存。';
+    return `${prefix}${captureIndexSummaryText(status)}。未获得：未记录、格式暂不支持或记录无效。`;
+  }
+
+  async function probeCaptureIndexStatus(library: Library) {
+    if (!desktop) return;
+    try {
+      const status = await execute<CaptureIndexStatus>('library.capture_index.status', {
+        library_id: library.id,
+      });
+      if (!disposed) syncCaptureIndexTask(library, status, false);
+    } catch {
+      /* Status check is opportunistic on entry; explicit menu action reports errors. */
+    }
+  }
+
+  async function startCaptureIndex(library: Library) {
+    if (!desktop || tasks.isRunning('capture_index', library.id)) return;
+    setError('');
+    setNotice('');
+    try {
+      let current = captureStatuses()[library.id];
+      if (!current || !current.pending) {
+        current = await execute<CaptureIndexStatus>('library.capture_index.status', {
+          library_id: library.id,
+        });
+        if (disposed) return;
+        syncCaptureIndexTask(library, current, false);
+      }
+      if (current.job && ['running', 'stopping'].includes(current.job.status)) return;
+      if (!current.pending) {
+        setNotice(`无需补全拍摄时间（${captureIndexSummaryText(current)}）。`);
+        return;
+      }
+      const started = await execute<CaptureIndexStatus>('library.capture_index.start', {
+        library_id: library.id,
+      });
+      if (!disposed) syncCaptureIndexTask(library, started, true);
+    } catch (e) {
+      if (!disposed) setError(errorMessage(e));
+    }
+  }
+
+  async function cancelCaptureIndex(library: Library, jobId?: string) {
+    const tracker = captureIndexTrackers.get(library.id);
+    if (tracker) {
+      if (tracker.timer) {
+        clearTimeout(tracker.timer);
+        tracker.timer = undefined;
+      }
+      tasks.progress(tracker.taskId, { cancelling: true });
+    }
+    try {
+      const next = await execute<CaptureIndexStatus>('library.capture_index.cancel', {
+        library_id: library.id,
+        ...(jobId ? { job_id: jobId } : {}),
+      });
+      if (!disposed) syncCaptureIndexTask(library, next, true);
+    } catch (e) {
+      if (!disposed) {
+        if (tracker) tasks.progress(tracker.taskId, { cancelling: false });
+        setError(errorMessage(e));
+      }
+    }
+  }
+
+  function syncCaptureIndexTask(library: Library, status: CaptureIndexStatus, notify = false) {
+    if (!status || status.library_id !== library.id) return;
+    setCaptureStatuses((prev) => ({ ...prev, [library.id]: status }));
     const job = status.job;
     const running = !!job && ['running', 'stopping'].includes(job.status);
     let tracker = captureIndexTrackers.get(library.id);
+    const summary = captureIndexSummaryText(status);
     if (running && job) {
-      const detail = `${job.processed} / ${job.total}`;
+      completedCaptureJobs.delete(job.id);
+      const detail = `${job.status === 'stopping' ? '正在停止' : '读取'} ${job.processed} / ${job.total} · ${summary}`;
+      const onCancel = () => void cancelCaptureIndex(library, job.id);
       if (!tracker) {
         const taskId = tasks.start({
           kind: 'capture_index',
           libraryId: library.id,
           title: `拍摄时间索引 · ${library.name}`,
+          progressLabel: '拍摄时间索引进度',
           processed: job.processed,
           total: job.total,
           detail,
+          cancelLabel: '停止拍摄时间索引',
+          cancelling: job.status === 'stopping',
+          onCancel,
         });
         tracker = { taskId, libraryName: library.name };
         captureIndexTrackers.set(library.id, tracker);
       } else {
         tasks.progress(tracker.taskId, {
           title: `拍摄时间索引 · ${library.name}`,
+          progressLabel: '拍摄时间索引进度',
           processed: job.processed,
           total: job.total,
           detail,
+          cancelLabel: '停止拍摄时间索引',
+          cancelling: job.status === 'stopping',
+          onCancel,
         });
       }
       if (!tracker.timer && !disposed) {
@@ -1070,31 +1230,45 @@ export default function ManagementApp() {
             const next = await execute<CaptureIndexStatus>('library.capture_index.status', {
               library_id: library.id,
             });
-            if (!disposed) syncCaptureIndexTask(library, next);
+            if (!disposed) syncCaptureIndexTask(library, next, false);
           } catch {
-            /* Next poll or control mount reconciles. */
+            /* Next poll or menu action reconciles. */
           }
         }, 1000);
       }
       return;
     }
-    if (tracker) {
-      if (tracker.timer) clearTimeout(tracker.timer);
-      captureIndexTrackers.delete(library.id);
-      if (job?.status === 'failed') {
-        tasks.fail(tracker.taskId, job.error || '拍摄时间索引未完成');
-      } else if (job?.status === 'cancelled') {
-        tasks.complete(tracker.taskId, `已停止（${job.processed} / ${job.total}）`);
-      } else {
-        tasks.complete(
-          tracker.taskId,
-          job
-            ? `已完成 ${job.processed} / ${job.total}${job.failed ? `，${job.failed} 项待重试` : ''}`
-            : '拍摄时间索引已就绪',
-        );
+    if (tracker || notify) {
+      if (tracker) {
+        if (tracker.timer) clearTimeout(tracker.timer);
+        captureIndexTrackers.delete(library.id);
+        if (job?.status === 'failed') {
+          tasks.fail(tracker.taskId, job.error || '拍摄时间索引未完成');
+        } else if (job?.status === 'cancelled') {
+          tasks.complete(tracker.taskId, `已停止（${job.processed} / ${job.total}）· ${summary}`);
+        } else {
+          tasks.complete(
+            tracker.taskId,
+            job
+              ? `已完成 ${job.processed} / ${job.total}${job.failed ? `，${job.failed} 项待重试` : ''} · ${summary}`
+              : '拍摄时间索引已就绪',
+          );
+        }
+      }
+      if (libraryId() === library.id && job) {
+        if (job.status === 'failed') {
+          setError(job.error || '拍摄时间索引未完成，可重试剩余照片。');
+        } else if (job.status === 'cancelled') {
+          setNotice('已停止，已读取的结果已保留。');
+        } else {
+          setNotice(
+            `拍摄时间索引完成${job.failed ? `，${job.failed} 项待重试` : ''}（${summary}）。`,
+          );
+        }
       }
       if (job && !completedCaptureJobs.has(job.id)) {
         completedCaptureJobs.add(job.id);
+        setCaptureIndexRev((v) => v + 1);
         if (libraryId() === library.id) {
           void loadAssets(false, true);
           if (info()) void refetchDetail();
@@ -1588,13 +1762,13 @@ export default function ManagementApp() {
         setSection('libraries');
         setAllLibraries(false);
         setView('photos');
-        setFlag(command.flag);
+        chooseFlag(command.flag);
         break;
       case 'filter-rating':
         setSection('libraries');
         setAllLibraries(false);
         setView('photos');
-        setRating(command.rating ?? 0);
+        chooseRating(command.rating ?? 0);
         break;
       case 'filter-color':
         setSection('libraries');
@@ -1732,6 +1906,7 @@ export default function ManagementApp() {
       const library = libs[0];
       if (library) enterLibrary(library);
       const listing = await execute<{ items: Asset[]; total: number }>('asset.list', {
+        ...listOptions(),
         library_id: library?.id,
         limit: 200,
       });
@@ -2008,7 +2183,7 @@ export default function ManagementApp() {
           label: count > 1 ? `导出所选 ${count} 张为 JPEG…` : '导出 JPEG…',
           icon: 'export',
           shortcut: '⌘⇧E',
-          disabled: tasks.isRunning('export'),
+          disabled: tasks.isRunning('export') || (count === 1 && asset.kind === 'video'),
           onSelect: () => setExportDialogIds([...selectedIds()]),
         },
         ...(localSingle || (count === 1 && !!asset.path)
@@ -2221,7 +2396,9 @@ export default function ManagementApp() {
             {
               label: '补全拍摄时间…',
               icon: 'clock',
-              onSelect: open(() => setSort('captured_at')),
+              disabled: blocked || tasks.isRunning('capture_index', library.id),
+              title: reason || captureIndexMenuTitle(captureStatuses()[library.id]),
+              onSelect: () => void startCaptureIndex(library),
             },
             {
               label: '内容指纹…',
@@ -2396,9 +2573,20 @@ export default function ManagementApp() {
     updateNavigationMode();
     navigationMedia.addEventListener('change', updateNavigationMode);
     const stopWatchingRatio = watchDevicePixelRatio(setDevicePixelRatio);
+    const syncDefaultSort = () => {
+      const prev = untrack(defaultSort);
+      const next = readDefaultLibrarySort();
+      setDefaultSort(next);
+      if (untrack(sort) === prev.sortBy && untrack(direction) === prev.direction) {
+        setSort(next.sortBy);
+        setDirection(next.direction);
+      }
+    };
     void boot();
     window.addEventListener('keydown', keyboard);
     window.addEventListener('focus', focusRefresh);
+    window.addEventListener('storage', syncDefaultSort);
+    window.addEventListener(DEFAULT_SORT_CHANGED_EVENT, syncDefaultSort);
     void registerAssetListener();
     onCleanup(() => {
       disposed = true;
@@ -2414,8 +2602,11 @@ export default function ManagementApp() {
         if (tracker.timer) clearTimeout(tracker.timer);
       }
       captureIndexTrackers.clear();
+      toolbarObserver?.disconnect();
       window.removeEventListener('keydown', keyboard);
       window.removeEventListener('focus', focusRefresh);
+      window.removeEventListener('storage', syncDefaultSort);
+      window.removeEventListener(DEFAULT_SORT_CHANGED_EVENT, syncDefaultSort);
       navigationMedia.removeEventListener('change', updateNavigationMode);
       stopWatchingRatio();
     });
@@ -2491,7 +2682,7 @@ export default function ManagementApp() {
         ref={fileInput}
         class="visually-hidden"
         type="file"
-        accept="image/*,.dng,.cr2,.nef,.arw,.raf,.orf,.rw2"
+        accept="image/*,video/*,.dng,.cr2,.cr3,.nef,.arw,.raf,.orf,.rw2,.mkv,.mts,.m2ts"
         multiple
         aria-label="选择浏览器演示图片"
         onChange={importBrowser}
@@ -2706,7 +2897,7 @@ export default function ManagementApp() {
                     />
                   </div>
                 </Show>
-                <Toolbar label="照片工具栏" class="library-toolbar">
+                <Toolbar label="照片工具栏" class="library-toolbar" ref={bindLibraryToolbar}>
                   <TextInput
                     ref={(el) => (searchInput = el)}
                     size="sm"
@@ -2760,102 +2951,122 @@ export default function ManagementApp() {
                       ? '正在读取索引…'
                       : `${total().toLocaleString()} 张${fileTotal() !== undefined && fileTotal() !== total() ? ` · ${fileTotal()!.toLocaleString()} 文件` : ''}`}
                   </span>
-                  <Show when={sort() === 'captured_at'}>
-                    <Toggle
-                      pressed={burstStacks()}
-                      title="按同机身与相邻拍摄时间（≤ 2 秒）自动折叠连拍组"
-                      onChange={(on) => toggleBurstStacks(on)}
-                      icon="copy"
+                  <Show when={view() === 'photos'}>
+                    <Show when={toolbarDensity() === 'wide'}>
+                      <Show when={sort() === 'captured_at'}>
+                        <Toggle
+                          pressed={burstStacks()}
+                          title="按同机身与相邻拍摄时间（≤ 2 秒）自动折叠连拍组"
+                          onChange={(on) => toggleBurstStacks(on)}
+                          icon="copy"
+                        >
+                          折叠连拍
+                        </Toggle>
+                      </Show>
+                      <Toggle
+                        pressed={flag() === 'not_reject' || flag() === 'pick' || flag() === 'none'}
+                        disabled={flag() === 'pick' || flag() === 'none'}
+                        title={
+                          flag() === 'pick' || flag() === 'none'
+                            ? '当前旗标筛选已排除淘汰照片'
+                            : '隐藏已标记为淘汰的照片'
+                        }
+                        onChange={(on) => chooseFlag(on ? 'not_reject' : 'any')}
+                        icon="eye-off"
+                      >
+                        隐藏淘汰
+                      </Toggle>
+                    </Show>
+                    <Show when={toolbarDensity() !== 'narrow'}>
+                      <Select
+                        size="sm"
+                        aria-label="排序字段"
+                        value={sort()}
+                        title={sortSelectTitle(sort())}
+                        onChange={(value) =>
+                          setSort(value as NonNullable<AssetListOptions['sort_by']>)
+                        }
+                        options={SORT_OPTIONS}
+                      />
+                      <IconButton
+                        size="sm"
+                        icon={direction() === 'desc' ? 'sort-desc' : 'sort-asc'}
+                        label={
+                          direction() === 'desc'
+                            ? '排序方向：降序，切换为升序'
+                            : '排序方向：升序，切换为降序'
+                        }
+                        onClick={() => setDirection(direction() === 'desc' ? 'asc' : 'desc')}
+                      />
+                    </Show>
+                    <Show
+                      when={toolbarDensity() === 'wide'}
+                      fallback={
+                        <LibraryViewOptions
+                          includeSort={toolbarDensity() === 'narrow'}
+                          iconOnly={toolbarWidth() > 0 && toolbarWidth() < 490}
+                          sort={sort()}
+                          onSort={(value) => setSort(value)}
+                          direction={direction()}
+                          onToggleDirection={() =>
+                            setDirection(direction() === 'desc' ? 'asc' : 'desc')
+                          }
+                          defaultSort={defaultSort()}
+                          burstStacks={burstStacks()}
+                          onBurstStacks={(on) => toggleBurstStacks(on)}
+                          hideRejected={
+                            flag() === 'not_reject' || flag() === 'pick' || flag() === 'none'
+                          }
+                          hideRejectedLocked={flag() === 'pick' || flag() === 'none'}
+                          onHideRejected={(on) => chooseFlag(on ? 'not_reject' : 'any')}
+                          thumbSize={thumbSize()}
+                          onThumbSize={(value) => {
+                            setThumbSize(value);
+                            saveThumbSize(value);
+                          }}
+                          onReset={() => {
+                            const preferred = readDefaultLibrarySort();
+                            setDefaultSort(preferred);
+                            setSort(preferred.sortBy);
+                            setDirection(preferred.direction);
+                            toggleBurstStacks(false);
+                            if (flag() === 'not_reject') chooseFlag('any');
+                            setThumbSize(DEFAULT_THUMB_SIZE);
+                            saveThumbSize(DEFAULT_THUMB_SIZE);
+                          }}
+                        />
+                      }
                     >
-                      折叠连拍
-                    </Toggle>
-                  </Show>
-                  <Toggle
-                    pressed={flag() === 'not_reject' || flag() === 'pick' || flag() === 'none'}
-                    disabled={flag() === 'pick' || flag() === 'none'}
-                    title={
-                      flag() === 'pick' || flag() === 'none'
-                        ? '当前旗标筛选已排除淘汰照片'
-                        : '隐藏已标记为淘汰的照片'
-                    }
-                    onChange={(on) => setFlag(on ? 'not_reject' : 'any')}
-                    icon="eye-off"
-                  >
-                    隐藏淘汰
-                  </Toggle>
-                  <Select
-                    size="sm"
-                    aria-label="排序字段"
-                    value={sort()}
-                    title={
-                      sort() === 'captured_at'
-                        ? '按相机当地记录的拍摄时间排序；待索引或无有效时间的照片置后。'
-                        : sort() === 'created_at'
-                          ? '源文件创建时间；未提供时间的照片置后。旧远端库可扫描更新以补充。'
-                          : undefined
-                    }
-                    onChange={(value) => setSort(value as NonNullable<AssetListOptions['sort_by']>)}
-                    options={[
-                      { value: 'captured_at', label: '拍摄时间' },
-                      { value: 'created_at', label: '文件创建时间' },
-                      { value: 'modified_at', label: '文件修改时间' },
-                      { value: 'filename', label: '文件名' },
-                      { value: 'rating', label: '评级' },
-                    ]}
-                  />
-                  <IconButton
-                    size="sm"
-                    icon={direction() === 'desc' ? 'sort-desc' : 'sort-asc'}
-                    label={
-                      direction() === 'desc'
-                        ? '排序方向：降序，切换为升序'
-                        : '排序方向：升序，切换为降序'
-                    }
-                    onClick={() => setDirection(direction() === 'desc' ? 'asc' : 'desc')}
-                  />
-                  <Show when={desktop && sort() === 'captured_at'}>
-                    <CaptureIndexControl
-                      libraryId={library().id}
-                      onStatus={(status) => syncCaptureIndexTask(library(), status)}
-                      onSettled={async (status) => {
-                        const job = status.job;
-                        if (!job || completedCaptureJobs.has(job.id)) return;
-                        completedCaptureJobs.add(job.id);
-                        if (libraryId() === status.library_id) {
-                          await loadAssets(false, true);
-                          if (info()) await refetchDetail();
-                        } else dirtyLibraries.add(status.library_id);
-                      }}
+                      <Slider
+                        label="缩略图大小"
+                        min={150}
+                        max={320}
+                        step={10}
+                        value={thumbSize()}
+                        onInput={(value) => {
+                          setThumbSize(value);
+                          saveThumbSize(value);
+                        }}
+                      />
+                    </Show>
+                    <IconButton
+                      size="sm"
+                      icon="info"
+                      tipAlign="end"
+                      label="影像详情（I）"
+                      shortcut="I"
+                      pressed={info()}
+                      disabled={!selected()}
+                      onClick={() => setInfo((value) => !value)}
                     />
                   </Show>
-                  <Slider
-                    label="缩略图大小"
-                    min={150}
-                    max={320}
-                    step={10}
-                    value={thumbSize()}
-                    onInput={(value) => {
-                      setThumbSize(value);
-                      saveThumbSize(value);
-                    }}
-                  />
-                  <IconButton
-                    size="sm"
-                    icon="info"
-                    tipAlign="end"
-                    label="影像详情（I）"
-                    shortcut="I"
-                    pressed={info()}
-                    disabled={!selected()}
-                    onClick={() => setInfo((value) => !value)}
-                  />
                 </Toolbar>
                 <Show when={filtersOpen()}>
                   <LibraryFilterBar
                     rating={rating()}
-                    onRating={setRating}
+                    onRating={chooseRating}
                     flag={flag()}
-                    onFlag={setFlag}
+                    onFlag={chooseFlag}
                     colorLabel={colorLabel()}
                     onColorLabel={setColorLabel}
                     format={format()}
@@ -2884,10 +3095,10 @@ export default function ManagementApp() {
                     <div class="overview-layer">
                       <LibraryOverview
                         options={{ ...listOptions(), limit: undefined, offset: undefined }}
-                        refreshToken={total()}
+                        refreshToken={total() + captureIndexRev()}
                         scanning={tasks.isRunning('scan', library().id)}
                         onPick={(pick) => {
-                          setExtra(pick);
+                          applyOverviewPick(pick);
                           setView('photos');
                         }}
                         onCull={() => {

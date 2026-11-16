@@ -36,9 +36,15 @@ export function PageHeader(props: {
 }
 
 /** 44px toolbar under the header. */
-export function Toolbar(props: { children: JSX.Element; label?: string; class?: string }) {
+export function Toolbar(props: {
+  children: JSX.Element;
+  label?: string;
+  class?: string;
+  ref?: HTMLDivElement | ((el: HTMLDivElement) => void);
+}) {
   return (
     <div
+      ref={props.ref}
       class={`nl-toolbar${props.class ? ` ${props.class}` : ''}`}
       role="toolbar"
       aria-label={props.label}

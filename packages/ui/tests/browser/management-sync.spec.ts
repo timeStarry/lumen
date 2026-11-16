@@ -296,8 +296,14 @@ async function fixture(
           unprocessed: listed.length - picks - rejects - rated,
           undated: 0,
           days: [...days].sort().map(([day, count]) => ({ day, count })),
-          cameras: [{ name: 'Fixture camera', count: listed.length }],
-          lenses: [],
+          cameras: browserAssetFacets(listed, 'library').cameras.map((c) => ({
+            name: c.value,
+            count: c.count,
+          })),
+          lenses: browserAssetFacets(listed, 'library').lenses.map((l) => ({
+            name: l.value,
+            count: l.count,
+          })),
           focal: [],
           iso: [{ label: '≤100', min: 0, max: 100, count: listed.length }],
         };
@@ -625,23 +631,29 @@ test('capture metadata updates reorder the authoritative catalog without decodin
   ).toEqual([]);
   expect(await nodesUnchanged(page)).toBe(true);
 });
-test('capture indexing starts explicitly, remains independent of navigation, and cancellation preserves results with one catalog reconciliation', async ({
+test('capture indexing starts explicitly from the library menu, remains independent of navigation, and cancellation preserves results with one catalog reconciliation', async ({
   page,
 }) => {
   const { calls, assets, capture } = await fixture(page, 8, 0, false, false, true);
-  await expect(page.getByRole('button', { name: '索引拍摄时间', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '索引拍摄时间', exact: true })).toHaveCount(0);
   expect(calls.filter((call) => call.command === 'library.capture_index.start')).toEqual([]);
-  await page.getByRole('button', { name: '索引拍摄时间', exact: true }).click();
+  const openMore = () =>
+    page.locator('.nl-page-header:visible').getByRole('button', { name: '更多' }).click();
+  await openMore();
+  await page.getByRole('menuitem', { name: '补全拍摄时间…' }).click();
+  const pill = page.getByRole('button', { name: /^后台任务：拍摄时间索引/ });
+  await expect(pill).toBeVisible();
+  await pill.click();
   await expect(page.getByRole('progressbar', { name: '拍摄时间索引进度' })).toBeVisible();
+  await page.keyboard.press('Escape');
   await expect(page.getByRole('button', { name: '扫描更新', exact: true })).toBeEnabled();
   const nav = page.getByRole('navigation', { name: '主导航' });
   await nav.getByRole('button', { name: '设置', exact: true }).click();
   expect(calls.filter((call) => call.command === 'library.capture_index.cancel')).toEqual([]);
   await nav.getByRole('button', { name: '图片库', exact: true }).click();
   await page.getByRole('button', { name: '打开图片库 同步图库' }).click();
-  await expect(page.getByRole('progressbar', { name: '拍摄时间索引进度' })).toBeVisible();
-  // The task status mounts before the debounced catalog query. Establish the
-  // baseline from this gallery's loaded images, not the previous visit's RPCs.
+  await expect(pill).toBeVisible();
+  // Establish the baseline from this gallery's loaded images, not the previous visit's RPCs.
   await expect(page.locator('.photo-grid .thumbnail')).toHaveCount(8);
   await expect(page.locator('.photo-grid .thumbnail img')).toHaveCount(8);
   await expect
@@ -664,6 +676,8 @@ test('capture indexing starts explicitly, remains independent of navigation, and
   );
   await rememberNodes(page);
   const selected = await page.locator('.thumbnail.selected').getAttribute('aria-label');
+  await pill.click();
+  await expect(page.getByRole('progressbar', { name: '拍摄时间索引进度' })).toBeVisible();
   const before = calls.length;
   await page.getByRole('button', { name: '停止拍摄时间索引' }).click();
   await expect(page.getByRole('button', { name: '停止拍摄时间索引' })).toBeDisabled();
@@ -676,6 +690,7 @@ test('capture indexing starts explicitly, remains independent of navigation, and
   capture.pending = 7;
   Object.assign(capture.job!, { status: 'cancelled', processed: 1, found: 1 });
   await expect(page.getByText('已停止，已读取的结果已保留。')).toBeVisible();
+  await page.keyboard.press('Escape');
   await expect(page.locator('.photo-grid .thumbnail').first()).toHaveAttribute(
     'aria-label',
     'Photo-000.jpg，0 星',
@@ -697,7 +712,9 @@ test('capture indexing starts explicitly, remains independent of navigation, and
       );
     }),
   ).toBe(true);
-  await expect(page.getByRole('button', { name: '索引拍摄时间', exact: true })).toBeVisible();
+  await openMore();
+  await expect(page.getByRole('menuitem', { name: '补全拍摄时间…' })).toBeEnabled();
+  await page.keyboard.press('Escape');
   const finished = calls.length;
   await page.waitForTimeout(1200);
   expect(calls.slice(finished)).toEqual([]);
@@ -706,18 +723,25 @@ test('capture index failure leaves unread photos pending and exposes retry witho
   page,
 }) => {
   const { calls, capture } = await fixture(page, 4, 0, false, false, true);
-  await page.getByRole('button', { name: '索引拍摄时间', exact: true }).click();
+  const more = page.locator('.nl-page-header:visible').getByRole('button', { name: '更多' });
+  await more.click();
+  await page.getByRole('menuitem', { name: '补全拍摄时间…' }).click();
+  const pill = page.getByRole('button', { name: /^后台任务：拍摄时间索引/ });
+  await expect(pill).toBeVisible();
   Object.assign(capture.job!, {
     status: 'failed',
     processed: 1,
     failed: 1,
     error: '此远端不支持有界元信息读取。',
   });
-  await expect(page.getByRole('alert')).toContainText('此远端不支持有界元信息读取。');
-  const retry = page.getByRole('button', { name: '重试拍摄时间索引', exact: true });
-  await expect(retry).toBeVisible();
+  await expect(page.getByRole('alert').filter({ hasText: '此远端不支持有界元信息读取。' })).toBeVisible();
+  await more.click();
+  const retry = page.getByRole('menuitem', { name: '补全拍摄时间…' });
+  await expect(retry).toBeEnabled();
   await expect(retry).toHaveAttribute('title', /未获得 0 · 待索引 4/);
   await retry.click();
+  await expect(pill).toBeVisible();
+  await pill.click();
   await expect(page.getByRole('progressbar', { name: '拍摄时间索引进度' })).toBeVisible();
   expect(calls.filter((call) => call.command === 'library.capture_index.start')).toHaveLength(2);
 });
@@ -725,8 +749,11 @@ test('capture indexing completes with known and missing counts, reconciles once 
   page,
 }, testInfo) => {
   const { calls, assets, capture } = await fixture(page, 4, 0, false, false, true);
-  await page.getByRole('button', { name: '索引拍摄时间', exact: true }).click();
-  await expect(page.getByRole('progressbar', { name: '拍摄时间索引进度' })).toBeVisible();
+  const more = page.locator('.nl-page-header:visible').getByRole('button', { name: '更多' });
+  await more.click();
+  await page.getByRole('menuitem', { name: '补全拍摄时间…' }).click();
+  const pill = page.getByRole('button', { name: /^后台任务：拍摄时间索引/ });
+  await expect(pill).toBeVisible();
   await page.setViewportSize({ width: 1024, height: 768 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
     true,
@@ -739,14 +766,15 @@ test('capture indexing completes with known and missing counts, reconciles once 
   assets.slice(1).forEach((asset) => (asset.capture_status = 'missing'));
   Object.assign(capture, { known: 1, missing: 3, pending: 0 });
   Object.assign(capture.job!, { status: 'completed', processed: 4, found: 1, missing: 3 });
-  await expect(page.getByText('拍摄时间索引完成。')).toBeVisible();
+  await expect(page.getByText(/拍摄时间索引完成（已知 1 · 未获得 3 · 待索引 0）。/)).toBeVisible();
   await settle(page, calls);
   expect(calls.slice(before).filter((call) => call.command === 'asset.list')).toHaveLength(1);
-  await expect(page.getByRole('button', { name: '索引拍摄时间', exact: true })).toHaveCount(0);
-  await expect(page.getByText('拍摄时间索引完成。')).toHaveAttribute(
+  await more.click();
+  await expect(page.getByRole('menuitem', { name: '补全拍摄时间…' })).toHaveAttribute(
     'title',
     /已知 1 · 未获得 3 · 待索引 0/,
   );
+  await page.keyboard.press('Escape');
   await page.screenshot({ path: testInfo.outputPath('capture-index-completed.png') });
   await selectChoice(page.getByLabel('排序字段'), 'filename');
   await expect
@@ -1401,7 +1429,9 @@ test('the overview counts the filtered library and every figure leads back to it
 }) => {
   const { calls } = await fixture(page, 12, 0, false, false, false, (assets) => {
     assets[0].flag = 'pick';
+    assets[0].metadata = { Camera: 'NIKON Z 30' };
     assets[1].flag = 'pick';
+    assets[1].metadata = { Camera: 'NIKON Z 30' };
     assets[2].flag = 'reject';
     assets[3].rating = 3;
   });
@@ -1422,9 +1452,79 @@ test('the overview counts the filtered library and every figure leads back to it
     .poll(() => calls.filter((call) => call.command === 'asset.list').at(-1)?.params)
     .toMatchObject({ flag: 'none', rating_max: 0 });
   await expect(page.locator('.collection-status')).toContainText('8 张');
-  // The overview then follows the same filter as the grid.
+  // The overview then follows the same filter as the grid and hides grid-only presentation controls.
   await page.keyboard.press('Meta+3');
   await expect(overview).toContainText('8张照片');
+  await expect(page.locator('.library-toolbar').getByLabel('排序字段')).toHaveCount(0);
+  await expect(page.locator('.library-toolbar').getByLabel('缩略图大小')).toHaveCount(0);
+  // Clearing the filter while staying on Overview immediately updates Overview back to full stats.
+  await page.getByRole('button', { name: '移除筛选：未处理' }).click();
+  await expect(page.locator('.collection-status')).toContainText('12 张');
+  await expect(overview).toContainText('12张照片');
+  await expect(overview).toContainText('17%留用率');
+  // Drilling into a camera syncs the first-class camera filter bar control, and Clear All restores Overview.
+  await overview.getByRole('button', { name: /NIKON Z 30/ }).click();
+  await expect(page.getByRole('tab', { name: '照片' })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByLabel('机身筛选')).toHaveAttribute('data-value', 'NIKON Z 30');
+  await page.keyboard.press('Meta+3');
+  await expect(overview).toContainText('2张照片');
+  await page.getByRole('button', { name: '清除全部' }).click();
+  await expect(overview).toContainText('12张照片');
+});
+
+test('the library toolbar folds view controls into 显示选项 at narrow widths with zero overlap', async ({
+  page,
+}) => {
+  await fixture(page, 8, 0, false, false, true);
+  const toolbar = page.locator('.library-toolbar');
+  const assertNoToolbarOverlap = async () => {
+    const boxes = await toolbar.evaluate((el) =>
+      [...el.children]
+        .filter((child) => {
+          const rect = child.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        })
+        .map((child) => {
+          const r = child.getBoundingClientRect();
+          return { left: r.left, right: r.right, tag: child.className || child.tagName };
+        }),
+    );
+    for (let i = 1; i < boxes.length; i++) {
+      expect(boxes[i].left, `${boxes[i - 1].tag} vs ${boxes[i].tag}`).toBeGreaterThanOrEqual(
+        boxes[i - 1].right - 0.5,
+      );
+    }
+  };
+
+  // Wide (1440): controls are flat inline; 显示选项 is absent.
+  await expect(toolbar.getByLabel('缩略图大小')).toBeVisible();
+  await expect(toolbar.getByRole('button', { name: '显示选项' })).toHaveCount(0);
+  await assertNoToolbarOverlap();
+
+  // Medium (960 with 220px sidebar -> 684px toolbar): slider & toggles fold into 显示选项; sort stays inline.
+  await page.setViewportSize({ width: 960, height: 640 });
+  await expect(toolbar.getByRole('button', { name: '显示选项' })).toBeVisible();
+  await expect(toolbar.getByLabel('缩略图大小')).toHaveCount(0);
+  await expect(toolbar.getByLabel('排序字段')).toBeVisible();
+  await assertNoToolbarOverlap();
+
+  // Interact with controls inside 显示选项 popover and verify Escape returns focus.
+  const viewTrigger = toolbar.getByRole('button', { name: '显示选项' });
+  await viewTrigger.click();
+  const popover = page.getByRole('dialog', { name: '显示选项' });
+  await expect(popover).toBeVisible();
+  await popover.getByRole('switch', { name: '隐藏淘汰' }).click();
+  await expect(page.getByLabel('当前筛选')).toContainText('隐藏淘汰');
+  await page.keyboard.press('Escape');
+  await expect(popover).toHaveCount(0);
+  await expect(viewTrigger).toBeFocused();
+
+  // Narrow (560 drawer mode): sort controls also move into 显示选项 and nothing overlaps.
+  await page.setViewportSize({ width: 560, height: 640 });
+  await expect(toolbar.getByLabel('排序字段')).toHaveCount(0);
+  await assertNoToolbarOverlap();
+  await viewTrigger.click();
+  await expect(popover.getByLabel('排序字段')).toBeVisible();
 });
 
 test('⌘⌫ moves the selected photo to the Trash and the toast puts it back', async ({ page }) => {

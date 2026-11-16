@@ -14,14 +14,15 @@ pub use credentials::{CredentialStore, CredentialStoreError, SystemCredentialSto
 pub use range_reader::{
     RangeObjectIdentity, RangeReadError, RangeReadOptions, RangeReadStats, RemoteRangeReader,
 };
+pub use remote::{MediaRangeRequest, MediaSlice, MediaStreamResponse};
 pub use remote_write::{RemoteWriter, WriteCapability, WriteCheck};
 pub use snapshot_browser::StorageBrowser;
 
 pub use transport::{inspect_tls, TlsCertificateInfo};
 
 pub use safe::{
-    atomic_json, hash_reader, open_scoped, publish_reader, safe_join, validate_key,
-    PreparedDestination, ScopedDestination,
+    atomic_json, hash_reader, open_scoped, publish_reader, quick_fingerprint_reader, safe_join,
+    validate_key, PreparedDestination, ScopedDestination, ScopedSource,
 };
 
 use anyhow::{bail, Context, Result};
@@ -804,6 +805,133 @@ impl StorageRegistry {
     /// `read` or `seek` only after releasing any outer registry lock.
     pub fn open_range_reader(&self, id: &str, key: &str) -> Result<RemoteRangeReader> {
         self.open_range_reader_with_options(id, key, RangeReadOptions::default())
+    }
+
+    /// Snapshots connection credentials for a bounded media byte-range fetch so
+    /// network I/O runs after dropping any outer `StorageRegistry` lock.
+    pub fn prepare_media_slice(
+        &self,
+        id: &str,
+        key: &str,
+    ) -> Result<impl FnOnce(u64, u64) -> Result<MediaSlice>> {
+        validate_key(key, false)?;
+        let config = self.config(id)?.clone();
+        let key_owned = key.to_owned();
+        if config.kind == "local" {
+            let root = safe_join(Path::new(&config.endpoint), &config.root, true)?;
+            return Ok(Box::new(move |start: u64, end_inclusive: u64| {
+                use std::io::{Seek, SeekFrom};
+                let mut file = open_scoped(&root, &key_owned)?;
+                let total_len = file.metadata()?.len();
+                if total_len == 0 {
+                    return Ok(MediaSlice {
+                        bytes: Vec::new(),
+                        start: 0,
+                        end: 0,
+                        total_len: 0,
+                        partial: false,
+                    });
+                }
+                if start >= total_len {
+                    bail!("E_RANGE_UNSATISFIABLE:{total_len}");
+                }
+                let end = end_inclusive
+                    .min(start.saturating_add(8 * 1024 * 1024 - 1))
+                    .min(total_len - 1);
+                let len = (end - start + 1) as usize;
+                file.seek(SeekFrom::Start(start))?;
+                let mut bytes = vec![0_u8; len];
+                file.read_exact(&mut bytes)?;
+                Ok(MediaSlice {
+                    bytes,
+                    start,
+                    end,
+                    total_len,
+                    partial: true,
+                })
+            })
+                as Box<dyn FnOnce(u64, u64) -> Result<MediaSlice>>);
+        }
+        let credentials = self.credentials_for(&config)?;
+        let client = self.client(&config)?;
+        Ok(Box::new(move |start: u64, end_inclusive: u64| {
+            remote::read_media_slice(
+                &client,
+                &config,
+                &credentials,
+                &key_owned,
+                start,
+                end_inclusive,
+            )
+        }))
+    }
+
+    /// Snapshots connection credentials for an unbuffered HTTP byte-range video stream
+    /// so network/disk streaming runs outside any `StorageRegistry` lock.
+    pub fn prepare_media_stream(
+        &self,
+        id: &str,
+        key: &str,
+    ) -> Result<Box<dyn FnOnce(MediaRangeRequest) -> Result<MediaStreamResponse> + Send>> {
+        validate_key(key, false)?;
+        let config = self.config(id)?.clone();
+        let key_owned = key.to_owned();
+        if config.kind == "local" {
+            let root = safe_join(Path::new(&config.endpoint), &config.root, true)?;
+            return Ok(Box::new(move |range: MediaRangeRequest| {
+                use std::io::{Seek, SeekFrom};
+                let mut file = open_scoped(&root, &key_owned)?;
+                let total_len = file.metadata()?.len();
+                if total_len == 0 {
+                    if !matches!(range, MediaRangeRequest::Full) {
+                        bail!("E_RANGE_UNSATISFIABLE:0");
+                    }
+                    return Ok(MediaStreamResponse {
+                        reader: Box::new(std::io::empty()),
+                        start: 0,
+                        end: 0,
+                        total_len: 0,
+                        partial: false,
+                    });
+                }
+                let (start, end, partial) = match range {
+                    MediaRangeRequest::Full => (0, total_len - 1, false),
+                    MediaRangeRequest::FromTo(s, opt_e) => {
+                        if s >= total_len {
+                            bail!("E_RANGE_UNSATISFIABLE:{total_len}");
+                        }
+                        let e = opt_e
+                            .map(|req| req.min(total_len - 1))
+                            .unwrap_or(total_len - 1);
+                        if e < s {
+                            bail!("E_RANGE_UNSATISFIABLE:{total_len}");
+                        }
+                        (s, e, true)
+                    }
+                    MediaRangeRequest::Suffix(suffix) => {
+                        if suffix == 0 {
+                            bail!("E_RANGE_UNSATISFIABLE:{total_len}");
+                        }
+                        let take = suffix.min(total_len);
+                        (total_len - take, total_len - 1, true)
+                    }
+                };
+                file.seek(SeekFrom::Start(start))?;
+                let take_len = end - start + 1;
+                Ok(MediaStreamResponse {
+                    reader: Box::new(file.take(take_len)),
+                    start,
+                    end,
+                    total_len,
+                    partial,
+                })
+            }));
+        }
+        let credentials = self.credentials_for(&config)?;
+        let client = transport::streaming_client(&config)?;
+        Ok(Box::new(move |range: MediaRangeRequest| {
+            remote::open_media_stream(&client, &config, &credentials, &key_owned, range)
+        }))
     }
 
     pub fn open_range_reader_with_options(

@@ -159,7 +159,11 @@ export function browserAssetList(
       ? item.kind === 'raw'
       : options.format === 'jpeg'
         ? jpeg(item)
-        : true);
+        : options.format === 'video'
+          ? item.kind === 'video'
+          : options.format === 'photo'
+            ? item.kind !== 'video'
+            : true);
   const eligible = inLibrary.filter(matches);
   const groups = new Map<string, Asset[]>();
   if (paired)
@@ -283,6 +287,7 @@ export const defaultOrganizeRules = (): OrganizeRules => ({
   subfolder: '',
   rename_mode: 'keep',
   rename_prefix: '',
+  include_videos: true,
 });
 /** Mirrors neb-ingest's subfolder validation so the form can explain problems early. */
 export function subfolderError(value: string): string {

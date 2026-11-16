@@ -4,7 +4,10 @@ use super::*;
 use anyhow::bail;
 use neb_core::{Asset, CacheLease};
 use neb_storage::RangeReadError;
-use std::{fs::OpenOptions, io::Write};
+use std::{
+    fs::OpenOptions,
+    io::{Seek, SeekFrom, Write},
+};
 
 fn snapshot_capture_fields(snapshot: &Value) -> (String, &'static str) {
     if let (Some(date), Some(status)) = (
@@ -32,6 +35,55 @@ fn snapshot_capture_fields(snapshot: &Value) -> (String, &'static str) {
 
 const STREAM_PREVIEW_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const JPEG_RANGE_MIN_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_REMOTE_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_REMOTE_VIDEO_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const DEFAULT_MEDIA_SLICE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_MEDIA_SLICE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_FULL_MEDIA_BODY_BYTES: u64 = 32 * 1024 * 1024;
+
+fn remote_download_limit(asset: &Asset) -> u64 {
+    if asset.kind == "video" {
+        MAX_REMOTE_VIDEO_BYTES
+    } else {
+        MAX_REMOTE_IMAGE_BYTES
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteRangeSpec {
+    FromTo(u64, Option<u64>),
+    Suffix(u64),
+}
+
+#[derive(Debug)]
+pub struct MediaChunk {
+    pub bytes: Vec<u8>,
+    pub start: u64,
+    pub end: u64,
+    pub total_len: u64,
+    pub content_type: &'static str,
+    pub partial: bool,
+}
+
+pub struct MediaStream {
+    pub reader: Option<Box<dyn Read + Send>>,
+    pub start: u64,
+    pub end: u64,
+    pub total_len: u64,
+    pub content_type: &'static str,
+    pub partial: bool,
+}
+
+struct LeasedReader<R> {
+    inner: R,
+    _lease: Option<CacheLease>,
+}
+
+impl<R: Read> Read for LeasedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DownloadPriority {
@@ -240,9 +292,10 @@ impl Service {
                 return Ok(Some(lease));
             }
         }
+        let max_bytes = remote_download_limit(asset);
         ensure!(
-            asset.size <= 512 * 1024 * 1024,
-            "E_LIMIT: Remote image exceeds 512 MiB"
+            asset.size <= max_bytes,
+            "E_LIMIT: Remote media exceeds download limit"
         );
         let library = self.core.library(&asset.library_id)?;
         let source = library
@@ -259,7 +312,7 @@ impl Service {
         };
         let object_key = format!("{}:{generation}.{}", asset.id, asset.extension);
         let download_bound = if asset.size == 0 {
-            512 * 1024 * 1024
+            max_bytes
         } else {
             asset.size
         };
@@ -275,7 +328,7 @@ impl Service {
             .open_reader(source, key)?;
         let mut reader = BoundedImageReader {
             inner: reader,
-            remaining: usize::try_from(download_bound)?,
+            remaining: download_bound,
         };
         let mut file = OpenOptions::new()
             .write(true)
@@ -344,10 +397,11 @@ impl Service {
         uncropped: bool,
         prefer_raw: bool,
     ) -> Result<String> {
+        let kind_suffix = if asset.kind == "video" { ":vid2" } else { "" };
         let mode_suffix = if prefer_raw { ":raw" } else { "" };
         if asset.source_key.is_none() {
             return Ok(format!(
-                "preview-v3:{}:{}{mode_suffix}",
+                "preview-v3:{}:{}{kind_suffix}{mode_suffix}",
                 self.core.preview_fingerprint(&asset.id, uncropped)?,
                 tier.as_str()
             ));
@@ -369,7 +423,7 @@ impl Service {
             .and_then(|s| s["size"].as_u64())
             .unwrap_or(asset.size);
         Ok(format!(
-            "preview-v3:{}:{}:{}:{}:{}{mode_suffix}",
+            "preview-v3:{}:{}:{}:{}:{}{kind_suffix}{mode_suffix}",
             asset.id,
             fingerprint,
             size,
@@ -613,6 +667,7 @@ impl Service {
             self.fallback_remote_preview(asset, tier, uncropped, true, &policy)?
         } else {
             let should_try_range = asset.kind == "raw"
+                || asset.kind == "video"
                 || matches!(asset.extension.as_str(), "tif" | "tiff")
                 || (matches!(asset.extension.as_str(), "jpg" | "jpeg")
                     && (asset.size == 0
@@ -683,6 +738,17 @@ impl Service {
         prefer_raw: bool,
         policy: &str,
     ) -> Result<(Arc<PreviewImage>, Option<PreviewImage>)> {
+        if asset.kind == "video" {
+            if policy != "manual" && asset.size > 0 && asset.size <= 16 * 1024 * 1024 {
+                if let Ok((primary, companion)) =
+                    self.stream_remote_preview(asset, uncropped, tier, false)
+                {
+                    return Ok((Arc::new(primary), companion));
+                }
+            }
+            let (primary, companion) = neb_core::fallback_video_slate(&asset.extension, tier)?;
+            return Ok((Arc::new(primary), companion));
+        }
         match policy {
             "manual" => {
                 self.require_automatic_download()?;
@@ -735,7 +801,7 @@ impl Service {
             .open_reader(source, key)?;
         let mut reader = BoundedImageReader {
             inner: reader,
-            remaining: usize::try_from(download_bound)?,
+            remaining: download_bound,
         };
         let capacity = usize::try_from(asset.size)
             .unwrap_or(0)
@@ -771,6 +837,7 @@ impl Service {
     ) -> Result<(PreviewImage, Option<PreviewImage>)> {
         ensure!(
             asset.kind == "raw"
+                || asset.kind == "video"
                 || matches!(asset.extension.as_str(), "tif" | "tiff" | "jpg" | "jpeg"),
             "E_UNSUPPORTED_CODEC: This format requires the original file for rendering"
         );
@@ -969,6 +1036,9 @@ impl Service {
                 }
                 Ok(json!({"asset_id":id,"pinned":pinned,"stats":stats}))
             }
+            "asset.histogram" if asset.kind == "video" => {
+                bail!("E_UNSUPPORTED: 视频文件无静态像素直方图。");
+            }
             "asset.histogram" if asset.source_key.is_none() => {
                 // From the viewer tier the window already shows (cached on disk after the
                 // first view), then from memory: a RAW is never demosaiced twice for this.
@@ -1031,9 +1101,10 @@ impl Service {
                 if let Some(lease) = self.current_original(&asset)? {
                     return neb_core::export_original_file(lease.path(), Path::new(destination));
                 }
+                let max_bytes = remote_download_limit(&asset);
                 ensure!(
-                    asset.size <= 512 * 1024 * 1024,
-                    "E_LIMIT: Remote image exceeds 512 MiB"
+                    asset.size <= max_bytes,
+                    "E_LIMIT: Remote media exceeds download limit"
                 );
                 let _slot = self.download_slot()?;
                 let library = self.core.library(&asset.library_id)?;
@@ -1042,7 +1113,7 @@ impl Service {
                     .as_deref()
                     .context("E_NOT_FOUND: Remote library has no storage source")?;
                 let download_bound = if asset.size == 0 {
-                    512 * 1024 * 1024
+                    max_bytes
                 } else {
                     asset.size
                 };
@@ -1053,7 +1124,7 @@ impl Service {
                     .open_reader(source, key)?;
                 let reader = BoundedImageReader {
                     inner: reader,
-                    remaining: usize::try_from(download_bound)?,
+                    remaining: download_bound,
                 };
                 neb_core::export_original_from_reader(
                     reader,
@@ -1133,6 +1204,490 @@ impl Service {
             "cache.migration.get" => self.cache.migration_get(string(&params, "id")?),
             "cache.migration.cancel" => self.cache.migration_cancel(string(&params, "id")?),
             _ => Err(anyhow!("Unknown command: {command}")),
+        }
+    }
+
+    /// Streams a bounded byte slice of a video original for `neb://localhost/media/<id>/<rev>`.
+    /// Never reads an entire large video into memory and never acquires global catalog write locks.
+    pub fn read_media(
+        &self,
+        id: &str,
+        range: Option<ByteRangeSpec>,
+        head_only: bool,
+    ) -> std::result::Result<MediaChunk, CommandError> {
+        let asset = self.core.asset(id).map_err(CommandError::from)?;
+        if asset.kind != "video" {
+            return Err(CommandError {
+                code: "E_UNSUPPORTED_CODEC",
+                message: "E_UNSUPPORTED_CODEC: Media stream is only available for video assets"
+                    .into(),
+            });
+        }
+        let content_type = neb_core::video::mime_type(&asset.extension);
+
+        let local_lease = if asset.source_key.is_some() {
+            self.current_original(&asset).ok().flatten()
+        } else {
+            None
+        };
+        if asset.source_key.is_none() || local_lease.is_some() {
+            let path = if let Some(ref lease) = local_lease {
+                lease.path().to_path_buf()
+            } else {
+                self.core
+                    .resolve_local_asset_path(&asset)
+                    .map_err(CommandError::from)?
+            };
+            let mut file = File::open(&path).map_err(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    CommandError {
+                        code: "E_OFFLINE",
+                        message: "E_OFFLINE: Original video file is unavailable".into(),
+                    }
+                } else {
+                    CommandError::from(anyhow::Error::from(err))
+                }
+            })?;
+            let total_len = file
+                .metadata()
+                .map_err(|e| CommandError::from(anyhow::Error::from(e)))?
+                .len();
+            if total_len == 0 {
+                if range.is_some() {
+                    return Err(CommandError {
+                        code: "E_RANGE_UNSATISFIABLE",
+                        message: "0".into(),
+                    });
+                }
+                return Ok(MediaChunk {
+                    bytes: Vec::new(),
+                    start: 0,
+                    end: 0,
+                    total_len: 0,
+                    content_type,
+                    partial: false,
+                });
+            }
+            let (start, end, partial) = resolve_local_range(range, total_len, head_only)?;
+            if head_only {
+                return Ok(MediaChunk {
+                    bytes: Vec::new(),
+                    start,
+                    end,
+                    total_len,
+                    content_type,
+                    partial,
+                });
+            }
+            let slice_len = (end - start + 1) as usize;
+            file.seek(SeekFrom::Start(start))
+                .map_err(|e| CommandError::from(anyhow::Error::from(e)))?;
+            let mut bytes = Vec::with_capacity(slice_len);
+            file.take(slice_len as u64)
+                .read_to_end(&mut bytes)
+                .map_err(|e| CommandError::from(anyhow::Error::from(e)))?;
+            let actual_end = if bytes.is_empty() {
+                start
+            } else {
+                start + bytes.len() as u64 - 1
+            };
+            return Ok(MediaChunk {
+                bytes,
+                start,
+                end: actual_end,
+                total_len,
+                content_type,
+                partial,
+            });
+        }
+
+        let key = asset.source_key.as_deref().ok_or_else(|| CommandError {
+            code: "E_INVALID",
+            message: "E_INVALID: Missing remote source key".into(),
+        })?;
+        let library = self
+            .core
+            .library(&asset.library_id)
+            .map_err(CommandError::from)?;
+        let source = library.storage_id.as_deref().ok_or_else(|| CommandError {
+            code: "E_NOT_FOUND",
+            message: "E_NOT_FOUND: Remote library has no storage source".into(),
+        })?;
+
+        if head_only && asset.size > 0 {
+            let (start, end, partial) = resolve_local_range(range, asset.size, true)?;
+            return Ok(MediaChunk {
+                bytes: Vec::new(),
+                start,
+                end,
+                total_len: asset.size,
+                content_type,
+                partial,
+            });
+        }
+
+        let fetch_slice = self
+            .storage
+            .lock()
+            .map_err(|_| CommandError {
+                code: "E_WORKER",
+                message: "Storage state unavailable".into(),
+            })?
+            .prepare_media_slice(source, key)
+            .map_err(CommandError::from)?;
+
+        let (start, req_end) = match range {
+            Some(ByteRangeSpec::Suffix(suffix_len)) => {
+                if suffix_len == 0 {
+                    return Err(CommandError {
+                        code: "E_RANGE_UNSATISFIABLE",
+                        message: asset.size.to_string(),
+                    });
+                }
+                if asset.size > 0 {
+                    let take = suffix_len.min(MAX_MEDIA_SLICE_BYTES).min(asset.size);
+                    (asset.size - take, asset.size - 1)
+                } else {
+                    (0, DEFAULT_MEDIA_SLICE_BYTES - 1)
+                }
+            }
+            Some(ByteRangeSpec::FromTo(s, opt_e)) => {
+                if asset.size > 0 && s >= asset.size {
+                    return Err(CommandError {
+                        code: "E_RANGE_UNSATISFIABLE",
+                        message: asset.size.to_string(),
+                    });
+                }
+                let cap = if opt_e.is_some() {
+                    MAX_MEDIA_SLICE_BYTES - 1
+                } else {
+                    DEFAULT_MEDIA_SLICE_BYTES - 1
+                };
+                let mut e = opt_e
+                    .map(|req| req.min(s.saturating_add(cap)))
+                    .unwrap_or_else(|| s.saturating_add(cap));
+                if asset.size > 0 {
+                    e = e.min(asset.size - 1);
+                }
+                if e < s {
+                    return Err(CommandError {
+                        code: "E_RANGE_UNSATISFIABLE",
+                        message: asset.size.to_string(),
+                    });
+                }
+                (s, if head_only { s } else { e })
+            }
+            None => {
+                let mut e = DEFAULT_MEDIA_SLICE_BYTES - 1;
+                if asset.size > 0 {
+                    e = e.min(asset.size - 1);
+                }
+                (0, if head_only { 0 } else { e })
+            }
+        };
+
+        let slice = fetch_slice(start, req_end).map_err(|err| {
+            let msg = format!("{err:#}");
+            if let Some(total) = msg.strip_prefix("E_RANGE_UNSATISFIABLE:") {
+                CommandError {
+                    code: "E_RANGE_UNSATISFIABLE",
+                    message: total.trim().to_owned(),
+                }
+            } else {
+                CommandError::from(err)
+            }
+        })?;
+
+        Ok(MediaChunk {
+            bytes: if head_only { Vec::new() } else { slice.bytes },
+            start: slice.start,
+            end: if head_only && range.is_none() && slice.total_len > 0 {
+                slice.total_len - 1
+            } else {
+                slice.end
+            },
+            total_len: slice.total_len,
+            content_type,
+            partial: if head_only && range.is_none() {
+                false
+            } else {
+                slice.partial || range.is_some()
+            },
+        })
+    }
+
+    /// Opens an unbuffered byte-range stream for the loopback HTTP media server so
+    /// native `AVPlayer` / `WebView2` media decoders can seek `moov` atoms and stream
+    /// multi-gigabyte videos in `64 KiB` socket chunks without `WKURLSchemeHandler` buffering.
+    pub fn open_media_stream(
+        &self,
+        id: &str,
+        range: Option<ByteRangeSpec>,
+        head_only: bool,
+    ) -> std::result::Result<MediaStream, CommandError> {
+        let asset = self.core.asset(id).map_err(CommandError::from)?;
+        if asset.kind != "video" {
+            return Err(CommandError {
+                code: "E_UNSUPPORTED_CODEC",
+                message: "E_UNSUPPORTED_CODEC: Media stream is only available for video assets"
+                    .into(),
+            });
+        }
+        let content_type = neb_core::video::mime_type(&asset.extension);
+
+        let local_lease = if asset.source_key.is_some() {
+            self.current_original(&asset).ok().flatten()
+        } else {
+            None
+        };
+        if asset.source_key.is_none() || local_lease.is_some() {
+            let path = if let Some(ref lease) = local_lease {
+                lease.path().to_path_buf()
+            } else {
+                self.core
+                    .resolve_local_asset_path(&asset)
+                    .map_err(CommandError::from)?
+            };
+            let mut file = File::open(&path).map_err(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    CommandError {
+                        code: "E_OFFLINE",
+                        message: "E_OFFLINE: Original video file is unavailable".into(),
+                    }
+                } else {
+                    CommandError::from(anyhow::Error::from(err))
+                }
+            })?;
+            let total_len = file
+                .metadata()
+                .map_err(|e| CommandError::from(anyhow::Error::from(e)))?
+                .len();
+            if total_len == 0 {
+                if range.is_some() {
+                    return Err(CommandError {
+                        code: "E_RANGE_UNSATISFIABLE",
+                        message: "0".into(),
+                    });
+                }
+                return Ok(MediaStream {
+                    reader: if head_only {
+                        None
+                    } else {
+                        Some(Box::new(std::io::empty()))
+                    },
+                    start: 0,
+                    end: 0,
+                    total_len: 0,
+                    content_type,
+                    partial: false,
+                });
+            }
+            let (start, end, partial) = resolve_stream_range(range, total_len)?;
+            if head_only {
+                return Ok(MediaStream {
+                    reader: None,
+                    start,
+                    end,
+                    total_len,
+                    content_type,
+                    partial,
+                });
+            }
+            file.seek(SeekFrom::Start(start))
+                .map_err(|e| CommandError::from(anyhow::Error::from(e)))?;
+            let take_len = end - start + 1;
+            return Ok(MediaStream {
+                reader: Some(Box::new(LeasedReader {
+                    inner: file.take(take_len),
+                    _lease: local_lease,
+                })),
+                start,
+                end,
+                total_len,
+                content_type,
+                partial,
+            });
+        }
+
+        let key = asset.source_key.as_deref().ok_or_else(|| CommandError {
+            code: "E_INVALID",
+            message: "E_INVALID: Missing remote source key".into(),
+        })?;
+        let library = self
+            .core
+            .library(&asset.library_id)
+            .map_err(CommandError::from)?;
+        let source = library.storage_id.as_deref().ok_or_else(|| CommandError {
+            code: "E_NOT_FOUND",
+            message: "E_NOT_FOUND: Remote library has no storage source".into(),
+        })?;
+
+        if head_only && asset.size > 0 {
+            let (start, end, partial) = resolve_stream_range(range, asset.size)?;
+            return Ok(MediaStream {
+                reader: None,
+                start,
+                end,
+                total_len: asset.size,
+                content_type,
+                partial,
+            });
+        }
+
+        let open_remote = self
+            .storage
+            .lock()
+            .map_err(|_| CommandError {
+                code: "E_WORKER",
+                message: "Storage state unavailable".into(),
+            })?
+            .prepare_media_stream(source, key)
+            .map_err(CommandError::from)?;
+
+        let req = match range {
+            None => neb_storage::MediaRangeRequest::Full,
+            Some(ByteRangeSpec::FromTo(start, opt_end)) => {
+                if asset.size > 0 && start >= asset.size {
+                    return Err(CommandError {
+                        code: "E_RANGE_UNSATISFIABLE",
+                        message: asset.size.to_string(),
+                    });
+                }
+                let clamped_end = match (opt_end, asset.size) {
+                    (Some(e), sz) if sz > 0 => Some(e.min(sz - 1)),
+                    (Some(e), _) => Some(e),
+                    (None, sz) if sz > 0 => Some(sz - 1),
+                    (None, _) => None,
+                };
+                if let Some(e) = clamped_end {
+                    if e < start {
+                        return Err(CommandError {
+                            code: "E_RANGE_UNSATISFIABLE",
+                            message: asset.size.to_string(),
+                        });
+                    }
+                }
+                neb_storage::MediaRangeRequest::FromTo(start, clamped_end)
+            }
+            Some(ByteRangeSpec::Suffix(suffix_len)) => {
+                if suffix_len == 0 {
+                    return Err(CommandError {
+                        code: "E_RANGE_UNSATISFIABLE",
+                        message: asset.size.to_string(),
+                    });
+                }
+                neb_storage::MediaRangeRequest::Suffix(suffix_len)
+            }
+        };
+
+        let upstream = open_remote(req).map_err(|err| {
+            let msg = format!("{err:#}");
+            if let Some(total) = msg.strip_prefix("E_RANGE_UNSATISFIABLE:") {
+                CommandError {
+                    code: "E_RANGE_UNSATISFIABLE",
+                    message: total.trim().to_owned(),
+                }
+            } else {
+                CommandError::from(err)
+            }
+        })?;
+
+        Ok(MediaStream {
+            reader: if head_only {
+                None
+            } else {
+                Some(upstream.reader)
+            },
+            start: upstream.start,
+            end: upstream.end,
+            total_len: upstream.total_len,
+            content_type,
+            partial: upstream.partial,
+        })
+    }
+}
+
+fn resolve_stream_range(
+    range: Option<ByteRangeSpec>,
+    total_len: u64,
+) -> std::result::Result<(u64, u64, bool), CommandError> {
+    match range {
+        Some(ByteRangeSpec::Suffix(suffix_len)) => {
+            if suffix_len == 0 || total_len == 0 {
+                return Err(CommandError {
+                    code: "E_RANGE_UNSATISFIABLE",
+                    message: total_len.to_string(),
+                });
+            }
+            let take = suffix_len.min(total_len);
+            Ok((total_len - take, total_len - 1, true))
+        }
+        Some(ByteRangeSpec::FromTo(start, opt_end)) => {
+            if start >= total_len {
+                return Err(CommandError {
+                    code: "E_RANGE_UNSATISFIABLE",
+                    message: total_len.to_string(),
+                });
+            }
+            let end = opt_end
+                .map(|req| req.min(total_len - 1))
+                .unwrap_or(total_len - 1);
+            if end < start {
+                return Err(CommandError {
+                    code: "E_RANGE_UNSATISFIABLE",
+                    message: total_len.to_string(),
+                });
+            }
+            Ok((start, end, true))
+        }
+        None => Ok((0, total_len - 1, false)),
+    }
+}
+
+fn resolve_local_range(
+    range: Option<ByteRangeSpec>,
+    total_len: u64,
+    head_only: bool,
+) -> std::result::Result<(u64, u64, bool), CommandError> {
+    match range {
+        Some(ByteRangeSpec::Suffix(suffix_len)) => {
+            if suffix_len == 0 || total_len == 0 {
+                return Err(CommandError {
+                    code: "E_RANGE_UNSATISFIABLE",
+                    message: total_len.to_string(),
+                });
+            }
+            let take = suffix_len.min(MAX_MEDIA_SLICE_BYTES).min(total_len);
+            Ok((total_len - take, total_len - 1, true))
+        }
+        Some(ByteRangeSpec::FromTo(start, opt_end)) => {
+            if start >= total_len {
+                return Err(CommandError {
+                    code: "E_RANGE_UNSATISFIABLE",
+                    message: total_len.to_string(),
+                });
+            }
+            let cap = if opt_end.is_some() {
+                MAX_MEDIA_SLICE_BYTES - 1
+            } else {
+                DEFAULT_MEDIA_SLICE_BYTES - 1
+            };
+            let max_end = start.saturating_add(cap).min(total_len - 1);
+            let end = opt_end.map(|req| req.min(max_end)).unwrap_or(max_end);
+            if end < start {
+                return Err(CommandError {
+                    code: "E_RANGE_UNSATISFIABLE",
+                    message: total_len.to_string(),
+                });
+            }
+            Ok((start, end, true))
+        }
+        None => {
+            if head_only || total_len <= MAX_FULL_MEDIA_BODY_BYTES {
+                Ok((0, total_len - 1, false))
+            } else {
+                Ok((0, (DEFAULT_MEDIA_SLICE_BYTES - 1).min(total_len - 1), true))
+            }
         }
     }
 }

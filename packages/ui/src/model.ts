@@ -30,13 +30,40 @@ export interface Crop {
   width: number;
   height: number;
 }
+export const VIDEO_EXTENSIONS = [
+  'mp4',
+  'mov',
+  'm4v',
+  'webm',
+  'avi',
+  'mkv',
+  'mts',
+  'm2ts',
+  '3gp',
+] as const;
+
+export function isVideoExtension(ext: string): boolean {
+  const clean = ext.trim().replace(/^\./, '').toLowerCase();
+  return (VIDEO_EXTENSIONS as readonly string[]).includes(clean);
+}
+
+export function formatDurationSeconds(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return '';
+  const total = Math.round(seconds);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+
 export interface Asset {
   id: string;
   library_id: string;
   path: string;
   filename: string;
   extension: string;
-  kind: 'raster' | 'raw';
+  kind: 'raster' | 'raw' | 'video';
   size: number;
   /** Filesystem/source creation time; empty or absent when the source cannot provide it. */
   created_at?: string;
@@ -94,7 +121,7 @@ export interface AssetListOptions {
   captured_to?: string;
   query?: string;
   rating?: number;
-  format?: 'all' | 'raw' | 'jpeg';
+  format?: 'all' | 'photo' | 'raw' | 'jpeg' | 'video';
   sort_by?: 'captured_at' | 'created_at' | 'modified_at' | 'filename' | 'rating';
   sort_direction?: 'asc' | 'desc';
   limit?: number;
@@ -326,6 +353,7 @@ export interface OrganizeRules {
   subfolder: string;
   rename_mode?: RenameMode;
   rename_prefix?: string;
+  include_videos?: boolean;
 }
 export interface ImportPlan {
   id: string;

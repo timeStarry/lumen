@@ -486,6 +486,7 @@ impl Core {
         )?;
         nikon_upgrade::invalidate(&migration)?;
         migration.commit()?;
+        upgrade_asset_kind_check(&mut database)?;
         database.execute(
      "DELETE FROM assets WHERE trashed_at IS NOT NULL AND trashed_at < datetime('now','-30 days')",
      [],
@@ -705,6 +706,11 @@ impl Core {
                 }
                 let args: CropArgs = parse(params)?;
                 args.crop.validate()?;
+                let current = self.asset(&args.id)?;
+                ensure!(
+                    current.kind != "video",
+                    "E_UNSUPPORTED: 视频暂不支持画面裁剪"
+                );
                 let changed = self.db()?.execute(
                     "UPDATE assets SET crop_json=?1 WHERE id=?2",
                     params![serde_json::to_string(&args.crop)?, args.id],
@@ -741,6 +747,10 @@ impl Core {
             }
             "asset.histogram" => {
                 let asset = self.asset(&id(&params)?)?;
+                ensure!(
+                    asset.kind != "video",
+                    "E_UNSUPPORTED: 视频暂不支持静态直方图"
+                );
                 let path = self.checked_asset_path(&asset)?;
                 imaging::histogram(&path, asset.crop)
             }
@@ -761,6 +771,10 @@ impl Core {
                 }
                 let args: Export = parse(params)?;
                 let asset = self.asset(&args.id)?;
+                ensure!(
+                    asset.kind != "video",
+                    "E_UNSUPPORTED: 视频不支持图片预设冲印导出，请使用“导出原片”"
+                );
                 let path = self.checked_asset_path(&asset)?;
                 imaging::export_with_options(
                     &path,
@@ -1782,6 +1796,10 @@ impl Core {
         Ok(asset)
     }
 
+    pub fn resolve_local_asset_path(&self, asset: &Asset) -> Result<PathBuf> {
+        self.checked_asset_path(asset)
+    }
+
     fn checked_asset_path(&self, asset: &Asset) -> Result<PathBuf> {
         if asset.source_key.is_some() {
             if let Some(path) = crate::cache::resolve_asset_path(&*self.db()?, &asset.id)? {
@@ -2494,6 +2512,48 @@ pub(super) fn asset_row(row: &Row<'_>) -> rusqlite::Result<Asset> {
     })
 }
 
+/// Widens legacy `CHECK(kind IN ('raster','raw'))` on `assets` to allow `'video'`
+/// without copying rows, disturbing `assets_fts` rowids, or dropping foreign-key children.
+fn upgrade_asset_kind_check(database: &mut Connection) -> Result<()> {
+    let sql: Option<String> = database
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='assets'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(sql) = sql else {
+        return Ok(());
+    };
+    if sql.contains("'video'") || !sql.contains("CHECK(kind IN ('raster','raw'))") {
+        return Ok(());
+    }
+    let updated = sql.replacen(
+        "CHECK(kind IN ('raster','raw'))",
+        "CHECK(kind IN ('raster','raw','video'))",
+        1,
+    );
+    let _ = database.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, false);
+    let _ = database.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_WRITABLE_SCHEMA,
+        true,
+    );
+    let result = (|| -> Result<()> {
+        database.execute(
+            "UPDATE sqlite_schema SET sql=?1 WHERE type='table' AND name='assets'",
+            params![updated],
+        )?;
+        database.execute_batch("PRAGMA writable_schema=RESET;")?;
+        Ok(())
+    })();
+    let _ = database.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_WRITABLE_SCHEMA,
+        false,
+    );
+    let _ = database.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true);
+    result
+}
+
 #[cfg(all(test, windows))]
 mod windows_path_tests {
     use super::path_is_within;
@@ -2727,5 +2787,47 @@ mod inspection_cache_tests {
             core.dispatch("asset.list", json!({})).unwrap()["items"][0]["id"],
             asset["id"]
         );
+    }
+
+    #[test]
+    fn legacy_catalog_widens_kind_check_for_video_and_rejects_unknown_kind() {
+        let temp = tempfile::tempdir().unwrap();
+        let catalog_dir = temp.path().join("catalog");
+        fs::create_dir_all(&catalog_dir).unwrap();
+        let legacy_schema = include_str!("schema.sql").replacen(
+            "CHECK(kind IN ('raster','raw','video'))",
+            "CHECK(kind IN ('raster','raw'))",
+            1,
+        );
+        {
+            let db = rusqlite::Connection::open(catalog_dir.join("catalog.sqlite3")).unwrap();
+            db.execute_batch(&legacy_schema).unwrap();
+        }
+        let core = Core::open(&catalog_dir).unwrap();
+        let root = temp.path().join("media");
+        fs::create_dir(&root).unwrap();
+        let mut mp4 = Vec::new();
+        mp4.extend_from_slice(&20u32.to_be_bytes());
+        mp4.extend_from_slice(b"ftypisom\x00\x00\x02\x00isom");
+        fs::write(root.join("clip.mp4"), &mp4).unwrap();
+
+        let library = core.add_library("upgraded", &root).unwrap();
+        let report = core.scan(&library.id).unwrap();
+        assert_eq!(report.indexed, 1);
+        let listed = core
+            .dispatch(
+                "asset.list",
+                json!({"library_id": library.id, "format": "video"}),
+            )
+            .unwrap();
+        assert_eq!(listed["total"], 1);
+        assert_eq!(listed["items"][0]["kind"], "video");
+
+        // Verify CHECK constraint still rejects arbitrary unknown kinds.
+        let invalid = core.db().unwrap().execute(
+            "UPDATE assets SET kind='audio' WHERE library_id=?1",
+            rusqlite::params![library.id],
+        );
+        assert!(invalid.is_err());
     }
 }

@@ -9,11 +9,15 @@ export interface BackgroundTask {
   kind: TaskKind;
   libraryId?: string;
   title: string;
+  progressLabel?: string;
   detail?: string;
   processed?: number;
   total?: number;
   status: TaskStatus;
   error?: string;
+  cancelLabel?: string;
+  cancelling?: boolean;
+  onCancel?: () => void;
   startedAt: number;
   finishedAt?: number;
 }
@@ -22,16 +26,24 @@ export interface TaskStartInput {
   kind: TaskKind;
   libraryId?: string;
   title: string;
+  progressLabel?: string;
   detail?: string;
   processed?: number;
   total?: number;
+  cancelLabel?: string;
+  cancelling?: boolean;
+  onCancel?: () => void;
 }
 
 export interface TaskProgressPatch {
   title?: string;
+  progressLabel?: string;
   detail?: string;
   processed?: number;
   total?: number;
+  cancelLabel?: string;
+  cancelling?: boolean;
+  onCancel?: () => void;
 }
 
 export interface TaskCenter {
@@ -93,9 +105,13 @@ export function createTaskCenter(options?: { settleMs?: number }): TaskCenter {
       kind: input.kind,
       libraryId: input.libraryId,
       title: input.title,
+      progressLabel: input.progressLabel,
       detail: input.detail,
       processed: input.processed,
       total: input.total,
+      cancelLabel: input.cancelLabel,
+      cancelling: input.cancelling,
+      onCancel: input.onCancel,
       status: 'running',
       startedAt: Date.now(),
     };
@@ -110,9 +126,13 @@ export function createTaskCenter(options?: { settleMs?: number }): TaskCenter {
           ? {
               ...item,
               ...(patch.title !== undefined ? { title: patch.title } : {}),
+              ...(patch.progressLabel !== undefined ? { progressLabel: patch.progressLabel } : {}),
               ...(patch.detail !== undefined ? { detail: patch.detail } : {}),
               ...(patch.processed !== undefined ? { processed: patch.processed } : {}),
               ...(patch.total !== undefined ? { total: patch.total } : {}),
+              ...(patch.cancelLabel !== undefined ? { cancelLabel: patch.cancelLabel } : {}),
+              ...(patch.cancelling !== undefined ? { cancelling: patch.cancelling } : {}),
+              ...(patch.onCancel !== undefined ? { onCancel: patch.onCancel } : {}),
             }
           : item,
       ),
@@ -128,6 +148,8 @@ export function createTaskCenter(options?: { settleMs?: number }): TaskCenter {
           ? {
               ...item,
               status: 'completed',
+              cancelling: undefined,
+              onCancel: undefined,
               ...(detail !== undefined ? { detail } : {}),
               ...(item.total !== undefined ? { processed: item.total } : {}),
               finishedAt,
@@ -152,6 +174,8 @@ export function createTaskCenter(options?: { settleMs?: number }): TaskCenter {
           ? {
               ...item,
               status: 'failed',
+              cancelling: undefined,
+              onCancel: undefined,
               error,
               finishedAt,
             }

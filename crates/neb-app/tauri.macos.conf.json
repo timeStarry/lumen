@@ -137,6 +137,27 @@
         "mimeType": "image/x-samsung-srw",
         "role": "Viewer",
         "rank": "Alternate"
+      },
+      {
+        "ext": ["mp4", "m4v"],
+        "name": "MPEG-4 video",
+        "mimeType": "video/mp4",
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["mov"],
+        "name": "QuickTime movie",
+        "mimeType": "video/quicktime",
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["webm"],
+        "name": "WebM video",
+        "mimeType": "video/webm",
+        "role": "Viewer",
+        "rank": "Alternate"
       }
     ]
   }

@@ -83,4 +83,33 @@ describe('background task center', () => {
     center.clearFinished();
     expect(center.tasks()).toHaveLength(0);
   });
+
+  it('tracks cancellable task callbacks and clears them once settled', () => {
+    const center = createTaskCenter({ settleMs: 0 });
+    const onCancel = vi.fn();
+    const id = center.start({
+      kind: 'capture_index',
+      libraryId: 'lib-1',
+      title: '拍摄时间索引 · Z30大库',
+      progressLabel: '拍摄时间索引进度',
+      processed: 0,
+      total: 247,
+      cancelLabel: '停止拍摄时间索引',
+      onCancel,
+    });
+
+    expect(center.tasks()[0]).toMatchObject({
+      progressLabel: '拍摄时间索引进度',
+      cancelLabel: '停止拍摄时间索引',
+    });
+    center.tasks()[0]?.onCancel?.();
+    expect(onCancel).toHaveBeenCalledTimes(1);
+
+    center.progress(id, { cancelling: true, processed: 12 });
+    expect(center.tasks()[0]).toMatchObject({ cancelling: true, processed: 12 });
+
+    center.complete(id, '已停止');
+    expect(center.tasks()[0]?.onCancel).toBeUndefined();
+    expect(center.tasks()[0]?.cancelling).toBeUndefined();
+  });
 });

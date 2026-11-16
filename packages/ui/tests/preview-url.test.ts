@@ -2,8 +2,10 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   TIER_PIXELS,
   gridTier,
+  mediaUrl,
   previewTier,
   previewUrl,
+  resetMediaBaseCache,
   watchDevicePixelRatio,
 } from '../src/preview-url';
 
@@ -33,6 +35,7 @@ describe('preview tiers', () => {
 
 describe('previewUrl', () => {
   afterEach(() => {
+    resetMediaBaseCache();
     delete runtime.window;
     delete runtime.isTauri;
   });
@@ -52,6 +55,33 @@ describe('previewUrl', () => {
     );
     expect(previewUrl({ id: 'a1', preview_revision: 3 }, 'full', false, true)).toBe(
       'neb://localhost/' + encodeURIComponent('a1/full/0/3/raw'),
+    );
+  });
+
+  it('uses loopback media_stream_base for desktop video streaming and falls back cleanly', async () => {
+    runtime.isTauri = true;
+    runtime.window = {
+      __TAURI_INTERNALS__: {
+        invoke: async (cmd: string) =>
+          cmd === 'media_stream_base' ? 'http://127.0.0.1:49152/media/secret-tok' : null,
+        convertFileSrc: (p: string, proto: string) =>
+          proto + '://localhost/' + encodeURIComponent(p),
+      },
+    };
+    await expect(mediaUrl({ id: 'vid-1', preview_revision: 4 })).resolves.toBe(
+      'http://127.0.0.1:49152/media/secret-tok/vid-1/4',
+    );
+
+    resetMediaBaseCache();
+    runtime.window = {
+      __TAURI_INTERNALS__: {
+        invoke: async () => null,
+        convertFileSrc: (p: string, proto: string) =>
+          proto + '://localhost/' + encodeURIComponent(p),
+      },
+    };
+    await expect(mediaUrl({ id: 'vid-1', preview_revision: 2 })).resolves.toBe(
+      'neb://localhost/' + encodeURIComponent('media/vid-1/2'),
     );
   });
 });

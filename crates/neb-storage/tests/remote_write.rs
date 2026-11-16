@@ -15,8 +15,8 @@ enum Mode {
     Strict,
     /// Replaces existing content regardless of preconditions.
     Overwrites,
-    /// Returns different bytes on GET (WebDAV read-back must catch it).
-    Corrupts,
+    /// Fails every GET with 500 to prove single-pass WebDAV upload never re-downloads.
+    ForbidGet,
     /// S3 without conditional-write support.
     NoConditional,
 }
@@ -26,6 +26,7 @@ type Store = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 struct Server {
     endpoint: String,
     store: Store,
+    methods: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 fn hex_sha(bytes: &[u8]) -> String {
@@ -36,20 +37,30 @@ fn serve(kind: &'static str, mode: Mode) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let store: Store = Arc::default();
+    let methods: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
     let shared = store.clone();
+    let shared_methods = methods.clone();
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let store = shared.clone();
-            thread::spawn(move || handle(stream, &store, kind, mode));
+            let methods = shared_methods.clone();
+            thread::spawn(move || handle(stream, &store, &methods, kind, mode));
         }
     });
     Server {
         endpoint: format!("http://127.0.0.1:{port}/root/"),
         store,
+        methods,
     }
 }
 
-fn handle(mut stream: TcpStream, store: &Store, kind: &str, mode: Mode) {
+fn handle(
+    mut stream: TcpStream,
+    store: &Store,
+    methods: &Mutex<Vec<(String, String)>>,
+    kind: &str,
+    mode: Mode,
+) {
     let mut data = Vec::new();
     let mut buffer = [0u8; 8192];
     let header_end = loop {
@@ -85,6 +96,7 @@ fn handle(mut stream: TcpStream, store: &Store, kind: &str, mode: Mode) {
     }
     let key = |path: &str| path.split('?').next().unwrap().to_owned();
     let path = key(&path);
+    methods.lock().unwrap().push((method.clone(), path.clone()));
     let mut files = store.lock().unwrap();
     let (status, reply): (&str, Vec<u8>) = match method.as_str() {
         "HEAD" => (
@@ -96,7 +108,7 @@ fn handle(mut stream: TcpStream, store: &Store, kind: &str, mode: Mode) {
             vec![],
         ),
         "GET" => match files.get(&path) {
-            Some(bytes) if mode == Mode::Corrupts => ("200 OK", [bytes.as_slice(), b"!"].concat()),
+            _ if mode == Mode::ForbidGet => ("500 Internal Server Error", vec![]),
             Some(bytes) => ("200 OK", bytes.clone()),
             None => ("404 Not Found", vec![]),
         },
@@ -217,15 +229,42 @@ fn webdav_that_ignores_overwrite_protection_is_refused() {
 }
 
 #[test]
-fn webdav_read_back_mismatch_publishes_nothing() {
-    let server = serve("webdav", Mode::Corrupts);
+fn webdav_streaming_upload_never_redownloads_body_and_caches_mkcol_across_threads() {
+    let server = serve("webdav", Mode::ForbidGet);
     let (_data, registry, id) = registry("webdav", &server);
     let writer = registry.open_writer(&id).unwrap();
-    let error = put(&writer, "a.jpg", b"jpeg").unwrap_err();
-    assert!(format!("{error:#}").contains("E_VERIFY"));
+    thread::scope(|scope| {
+        for idx in 0..8 {
+            let writer = &writer;
+            scope.spawn(move || {
+                let payload = format!("frame-{idx}").into_bytes();
+                let expected = hex_sha(&payload);
+                let computed = writer
+                    .put_new_streaming(
+                        &format!("2026/2026-11-15/IMG_{idx:04}.JPG"),
+                        Cursor::new(payload.clone()),
+                        payload.len() as u64,
+                        None,
+                    )
+                    .unwrap();
+                assert_eq!(computed, expected);
+            });
+        }
+    });
+    assert_eq!(keys(&server).len(), 8);
+    let logged = server.methods.lock().unwrap().clone();
     assert!(
-        keys(&server).is_empty(),
-        "temporary file is removed, target never created"
+        logged.iter().all(|(method, _)| method != "GET"),
+        "WebDAV upload must never issue GET read-backs: {logged:?}"
+    );
+    let mkcols: Vec<_> = logged
+        .iter()
+        .filter(|(method, _)| method == "MKCOL")
+        .collect();
+    assert_eq!(
+        mkcols.len(),
+        2,
+        "MKCOL must be cached once per unique folder prefix across concurrent workers: {mkcols:?}"
     );
 }
 

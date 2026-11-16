@@ -1,10 +1,21 @@
-import type { AssetListOptions, Library, LibraryStats, StatsBin } from './model';
+import type { AssetListOptions, FlagFilter, Library, LibraryStats, StatsBin } from './model';
 import { availabilityPresentation, isRemoteLibrary } from './workspace';
 
 export type OverviewPick = {
   label: string;
   options: Partial<AssetListOptions>;
 };
+
+export interface OverviewFilterPatch {
+  flag?: FlagFilter;
+  rating?: number;
+  camera?: string;
+  lens?: string;
+  capturedFrom?: string;
+  capturedTo?: string;
+  /** `null` clears any active compound extra pick; `undefined` leaves it untouched. */
+  extra?: OverviewPick | null;
+}
 
 export type TimelineGranularity = 'day' | 'week' | 'month';
 
@@ -469,4 +480,60 @@ export function summarizeLibraries(libraries: Library[]): LibrariesSummary {
     remote,
     totalPhotos,
   };
+}
+
+/**
+ * Maps an Overview drill-down pick onto first-class filter controls when possible
+ * (flag, camera, lens, date range), reserving `extra` only for compound/range bins
+ * (unprocessed, rated-without-flag, focal length, ISO) and clearing conflicting state.
+ */
+export function resolveOverviewPick(
+  pick: OverviewPick,
+  currentExtra?: OverviewPick,
+): OverviewFilterPatch {
+  const opts = pick.options;
+  const keys = (Object.keys(opts) as (keyof AssetListOptions)[]).filter(
+    (key) => opts[key] !== undefined,
+  );
+
+  if (keys.length === 1 && keys[0] === 'flag' && opts.flag) {
+    return {
+      flag: opts.flag,
+      extra: currentExtra?.options.flag !== undefined ? null : undefined,
+    };
+  }
+  if (keys.length === 1 && keys[0] === 'camera' && opts.camera !== undefined) {
+    return { camera: opts.camera };
+  }
+  if (keys.length === 1 && keys[0] === 'lens' && opts.lens !== undefined) {
+    return { lens: opts.lens };
+  }
+  if (
+    keys.length > 0 &&
+    keys.every((key) => key === 'captured_from' || key === 'captured_to')
+  ) {
+    return {
+      capturedFrom: opts.captured_from ?? '',
+      capturedTo: opts.captured_to ?? '',
+    };
+  }
+
+  return {
+    ...(opts.flag !== undefined ? { flag: 'any' as const } : {}),
+    ...(opts.rating !== undefined || opts.rating_max !== undefined ? { rating: 0 } : {}),
+    extra: pick,
+  };
+}
+
+/**
+ * Whether a manual toolbar/filter-bar change to `flag` or `rating` conflicts with the
+ * active compound `extra` pick and should clear `extra` so the user's choice wins.
+ */
+export function shouldClearExtraOnManualFilter(
+  extra: OverviewPick | undefined,
+  changed: 'flag' | 'rating',
+): boolean {
+  if (!extra) return false;
+  if (changed === 'flag') return extra.options.flag !== undefined;
+  return extra.options.rating !== undefined || extra.options.rating_max !== undefined;
 }

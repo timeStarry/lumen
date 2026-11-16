@@ -89,8 +89,10 @@ export default function LibraryFilterBar(props: {
         onChange={(value) => props.onFormat(value as NonNullable<AssetListOptions['format']>)}
         options={[
           { value: 'all', label: '所有格式' },
+          { value: 'photo', label: '仅照片' },
           { value: 'raw', label: 'RAW' },
           { value: 'jpeg', label: 'JPEG' },
+          { value: 'video', label: '视频' },
         ]}
       />
       <Show when={props.facets?.cameras.length}>

@@ -442,7 +442,17 @@ pub fn read<R: Read + Seek>(input: &mut R, length: u64) -> Result<CaptureTime> {
                 length: span.length,
             })
         } else {
-            Ok(result(CaptureStatus::Unsupported, BTreeMap::new()))
+            match crate::video::read_capture_metadata(reader.input, length)? {
+                Some(meta) => Ok(from_metadata(&meta)),
+                None => Ok(result(CaptureStatus::Unsupported, BTreeMap::new())),
+            }
+        }
+    } else if signature.len() >= 8
+        && matches!(&signature[4..8], b"moov" | b"mdat" | b"wide" | b"free")
+    {
+        match crate::video::read_capture_metadata(reader.input, length)? {
+            Some(meta) => Ok(from_metadata(&meta)),
+            None => Ok(result(CaptureStatus::Unsupported, BTreeMap::new())),
         }
     } else {
         Ok(result(CaptureStatus::Unsupported, BTreeMap::new()))

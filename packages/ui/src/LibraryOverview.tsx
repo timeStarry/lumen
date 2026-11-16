@@ -1,4 +1,4 @@
-import { createResource, For, Show } from 'solid-js';
+import { createMemo, createResource, For, Show } from 'solid-js';
 import { execute } from './api';
 import { Badge, Button, EmptyState } from './ui';
 import './library/overview.css';
@@ -30,7 +30,13 @@ export default function LibraryOverview(props: {
 }) {
   const [stats] = createResource(
     () => ({
-      query: JSON.stringify({ ...props.options, limit: undefined, offset: undefined }),
+      query: JSON.stringify({
+        ...props.options,
+        limit: undefined,
+        offset: undefined,
+        sort_by: undefined,
+        sort_direction: undefined,
+      }),
       rev: props.refreshToken ?? 0,
     }),
     ({ query }) => execute<LibraryStats>('asset.stats', JSON.parse(query)),
@@ -113,14 +119,15 @@ export default function LibraryOverview(props: {
       </Show>
       <Show when={stats()}>
         {(data) => {
-          const s = data();
-          const pickRate = pickRatePercent(s);
-          const segments = cullFunnelSegments(s);
-          const timeline = buildTimelineBuckets(s.days);
-          const spanText = formatCaptureSpan(s.days);
+          const pickRate = createMemo(() => pickRatePercent(data()));
+          const segments = createMemo(() => cullFunnelSegments(data()));
+          const timeline = createMemo(() => buildTimelineBuckets(data().days));
+          const spanText = createMemo(() => formatCaptureSpan(data().days));
+          const focalItems = createMemo(() => statsBinItems(data().focal, 'focal'));
+          const isoItems = createMemo(() => statsBinItems(data().iso, 'iso'));
           return (
             <Show
-              when={!props.scanning || s.photos > 0}
+              when={!props.scanning || data().photos > 0}
               fallback={
                 <EmptyState
                   icon="chart-bar"
@@ -135,52 +142,52 @@ export default function LibraryOverview(props: {
                 <div class="ov-kpi-grid">
                 <div class="ov-kpi-card">
                   <div class="ov-kpi-main">
-                    <b>{s.photos}</b>
+                    <b>{data().photos}</b>
                     <span>张照片</span>
                   </div>
-                  <p class="ov-kpi-sub">{s.files.toLocaleString()} 个原始文件</p>
+                  <p class="ov-kpi-sub">{data().files.toLocaleString()} 个原始文件</p>
                 </div>
 
                 <button
                   type="button"
                   class="ov-kpi-card ov-kpi-action"
-                  disabled={!s.picks}
+                  disabled={!data().picks}
                   onClick={() =>
-                    s.picks && props.onPick({ label: '留用', options: { flag: 'pick' } })
+                    data().picks && props.onPick({ label: '留用', options: { flag: 'pick' } })
                   }
                 >
                   <div class="ov-kpi-main">
-                    <b>{pickRate}%</b>
+                    <b>{pickRate()}%</b>
                     <span>留用率</span>
                   </div>
-                  <p class="ov-kpi-sub">已留用 {s.picks.toLocaleString()} 张</p>
+                  <p class="ov-kpi-sub">已留用 {data().picks.toLocaleString()} 张</p>
                 </button>
 
                 <button
                   type="button"
                   class="ov-kpi-card ov-kpi-action"
-                  disabled={!s.unprocessed}
+                  disabled={!data().unprocessed}
                   onClick={() =>
-                    s.unprocessed &&
+                    data().unprocessed &&
                     props.onPick({ label: '未处理', options: { flag: 'none', rating_max: 0 } })
                   }
                 >
                   <div class="ov-kpi-main">
-                    <b>{s.unprocessed}</b>
+                    <b>{data().unprocessed}</b>
                     <span>张待选片</span>
                   </div>
                   <p class="ov-kpi-sub">
-                    {s.rated > 0 ? `已评星 ${s.rated.toLocaleString()} 张` : '尚未开始筛选'}
+                    {data().rated > 0 ? `已评星 ${data().rated.toLocaleString()} 张` : '尚未开始筛选'}
                   </p>
                 </button>
 
                 <div class="ov-kpi-card">
                   <div class="ov-kpi-main">
-                    <b>{formatStorageBytes(s.bytes)}</b>
+                    <b>{formatStorageBytes(data().bytes)}</b>
                     <span>原片体积</span>
                   </div>
                   <p class="ov-kpi-sub">
-                    {s.undated ? `${s.undated.toLocaleString()} 张缺拍摄时间` : '拍摄时间完整'}
+                    {data().undated ? `${data().undated.toLocaleString()} 张缺拍摄时间` : '拍摄时间完整'}
                   </p>
                 </div>
               </div>
@@ -196,7 +203,7 @@ export default function LibraryOverview(props: {
                   </Button>
                 </div>
                 <div class="ov-funnel">
-                  <For each={segments}>
+                  <For each={segments()}>
                     {(seg) => (
                       <Show when={seg.count > 0}>
                         <button
@@ -212,7 +219,7 @@ export default function LibraryOverview(props: {
                   </For>
                 </div>
                 <div class="ov-pills">
-                  <For each={segments}>
+                  <For each={segments()}>
                     {(seg) => (
                       <button
                         type="button"
@@ -235,22 +242,22 @@ export default function LibraryOverview(props: {
                 <div class="ov-card-head">
                   <div class="ov-card-titles">
                     <h2>拍摄时间分布</h2>
-                    <Show when={timeline.buckets.length}>
-                      <Badge tone="info">{granularityLabel(timeline.granularity)}</Badge>
-                      <span class="ov-subtitle">{spanText}</span>
+                    <Show when={timeline().buckets.length}>
+                      <Badge tone="info">{granularityLabel(timeline().granularity)}</Badge>
+                      <span class="ov-subtitle">{spanText()}</span>
                     </Show>
                   </div>
-                  <Show when={s.undated}>
-                    <span class="ov-meta-note">另有 {s.undated.toLocaleString()} 张缺拍摄时间</span>
+                  <Show when={data().undated}>
+                    <span class="ov-meta-note">另有 {data().undated.toLocaleString()} 张缺拍摄时间</span>
                   </Show>
                 </div>
                 <Show
-                  when={timeline.buckets.length}
+                  when={timeline().buckets.length}
                   fallback={<p class="ov-empty">没有拍摄时间记录</p>}
                 >
                   <Bars
                     label="拍摄时间分布"
-                    items={timeline.buckets.map((bucket) => ({
+                    items={timeline().buckets.map((bucket) => ({
                       key: bucket.key,
                       tick: bucket.tick,
                       count: bucket.count,
@@ -269,14 +276,14 @@ export default function LibraryOverview(props: {
                   <div class="ov-card-head">
                     <h2>常用机身</h2>
                   </div>
-                  <Ranked rows={s.cameras} total={s.photos} filter="camera" />
+                  <Ranked rows={data().cameras} total={data().photos} filter="camera" />
                 </section>
 
                 <section class="ov-card">
                   <div class="ov-card-head">
                     <h2>常用镜头</h2>
                   </div>
-                  <Ranked rows={s.lenses} total={s.photos} filter="lens" />
+                  <Ranked rows={data().lenses} total={data().photos} filter="lens" />
                 </section>
 
                 <section class="ov-card">
@@ -284,8 +291,8 @@ export default function LibraryOverview(props: {
                     <h2>焦段分布</h2>
                     <span class="ov-subtitle">等效 / 物理焦距 mm</span>
                   </div>
-                  <Show when={s.focal.length} fallback={<p class="ov-empty">没有焦段记录</p>}>
-                    <Bars label="焦段分布" compact items={statsBinItems(s.focal, 'focal')} />
+                  <Show when={data().focal.length} fallback={<p class="ov-empty">没有焦段记录</p>}>
+                    <Bars label="焦段分布" compact items={focalItems()} />
                   </Show>
                 </section>
 
@@ -293,8 +300,8 @@ export default function LibraryOverview(props: {
                   <div class="ov-card-head">
                     <h2>感光度 ISO</h2>
                   </div>
-                  <Show when={s.iso.length} fallback={<p class="ov-empty">没有感光度记录</p>}>
-                    <Bars label="感光度 ISO" compact items={statsBinItems(s.iso, 'iso')} />
+                  <Show when={data().iso.length} fallback={<p class="ov-empty">没有感光度记录</p>}>
+                    <Bars label="感光度 ISO" compact items={isoItems()} />
                   </Show>
                 </section>
               </div>

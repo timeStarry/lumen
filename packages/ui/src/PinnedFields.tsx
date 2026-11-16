@@ -32,25 +32,40 @@ const COVERED: Record<string, string[]> = {
   captured: ['Captured', 'DateTimeOriginal'],
   dimensions: [],
 };
+const HIDDEN_INTERNAL_KEYS = new Set([
+  'Duration Seconds',
+  'Media Type',
+  'Capture Subsecond',
+]);
 const label = (id: FieldId) => (NAMED_FIELDS[id] ? fieldLabel(id) : metadataFieldLabel(id));
 
 /**
  * The photo's recorded fields: the ones the user pinned first, in their order, then every
  * other recorded field once, each with a pin. Pinned rows are focusable: Alt+↑/↓ reorders,
  * Enter unpins. Raw EXIF tags and decoder diagnostics stay in their own disclosures.
+ * On video clips, unrecorded pinned fields are omitted instead of showing placeholder `—`.
  */
 export default function PinnedFields(props: { asset: Asset }) {
   let list!: HTMLUListElement;
+  const visiblePinned = () =>
+    props.asset.kind === 'video'
+      ? pinned().filter((id) => fieldValue(id, props.asset) !== null)
+      : pinned();
   const others = () => {
-    // Exposure keys always show under the histogram; never repeat them here.
+    // On photos, exposure keys always show under the RGB histogram; on videos there is no
+    // histogram panel, so recorded exposure keys display unless `exposure` itself is pinned.
     const covered = new Set([
-      ...COVERED.exposure,
+      ...(props.asset.kind === 'video' ? [] : COVERED.exposure),
       ...pinned().flatMap((id) => [id, ...(COVERED[id] ?? [])]),
     ]);
     return Object.entries(props.asset.metadata ?? {})
       .filter(
         ([key, value]) =>
-          value?.trim() && !key.startsWith('EXIF ') && !diagnosticLabels[key] && !covered.has(key),
+          value?.trim() &&
+          !key.startsWith('EXIF ') &&
+          !diagnosticLabels[key] &&
+          !HIDDEN_INTERNAL_KEYS.has(key) &&
+          !covered.has(key),
       )
       .map(([key, value]) => ({ key, value: value.trim() }));
   };
@@ -78,34 +93,36 @@ export default function PinnedFields(props: { asset: Asset }) {
         <h3>拍摄信息</h3>
         <span>Alt+↑↓ 排序</span>
       </div>
-      <ul ref={list} class="nl-pinned-list" aria-label="固定显示">
-        <For
-          each={pinned()}
-          fallback={<li class="nl-pinned-empty">点下方字段的图钉，把它固定到这里。</li>}
-        >
-          {(id) => (
-            <li
-              class="nl-pinned-row"
-              data-field={id}
-              tabIndex={0}
-              onKeyDown={(event) => {
-                if (event.altKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
-                  event.preventDefault();
-                  event.stopPropagation();
-                  move(id, event.key === 'ArrowUp' ? -1 : 1);
-                } else if (event.key === 'Enter') {
-                  event.preventDefault();
-                  setPinned(togglePinned(pinned(), id));
-                }
-              }}
-            >
-              <span class="nl-pinned-label">{label(id)}</span>
-              <span class="nl-pinned-value">{fieldValue(id, props.asset) ?? '—'}</span>
-              <Pin id={id} />
-            </li>
-          )}
-        </For>
-      </ul>
+      <Show when={visiblePinned().length > 0 || props.asset.kind !== 'video'}>
+        <ul ref={list} class="nl-pinned-list" aria-label="固定显示">
+          <For
+            each={visiblePinned()}
+            fallback={<li class="nl-pinned-empty">点下方字段的图钉，把它固定到这里。</li>}
+          >
+            {(id) => (
+              <li
+                class="nl-pinned-row"
+                data-field={id}
+                tabIndex={0}
+                onKeyDown={(event) => {
+                  if (event.altKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    move(id, event.key === 'ArrowUp' ? -1 : 1);
+                  } else if (event.key === 'Enter') {
+                    event.preventDefault();
+                    setPinned(togglePinned(pinned(), id));
+                  }
+                }}
+              >
+                <span class="nl-pinned-label">{label(id)}</span>
+                <span class="nl-pinned-value">{fieldValue(id, props.asset) ?? '—'}</span>
+                <Pin id={id} />
+              </li>
+            )}
+          </For>
+        </ul>
+      </Show>
       <Show when={others().length}>
         <ul class="nl-pinned-list nl-other-fields" aria-label="全部字段">
           <For each={others()}>

@@ -628,3 +628,183 @@ fn unknown_capture_dates_stay_unknown_unless_modified_time_is_chosen() {
         .plan_with_rules(source.path(), destination.path(), &bad, true)
         .is_err());
 }
+
+fn synthetic_mp4_with_trailing_moov(creation_iso: &str, mdat_len: usize) -> Vec<u8> {
+    let mut ftyp = Vec::new();
+    ftyp.extend_from_slice(&20u32.to_be_bytes());
+    ftyp.extend_from_slice(b"ftypmp42");
+    ftyp.extend_from_slice(&0u32.to_be_bytes());
+    ftyp.extend_from_slice(b"mp42");
+
+    let mut mdat = Vec::with_capacity(8 + mdat_len);
+    mdat.extend_from_slice(&((8 + mdat_len) as u32).to_be_bytes());
+    mdat.extend_from_slice(b"mdat");
+    mdat.resize(8 + mdat_len, 0xAB);
+
+    let mut meta_payload = Vec::new();
+    meta_payload.extend_from_slice(b"com.apple.quicktime.creationdate");
+    meta_payload.extend_from_slice(creation_iso.as_bytes());
+    let mut udta = Vec::new();
+    udta.extend_from_slice(&((8 + meta_payload.len()) as u32).to_be_bytes());
+    udta.extend_from_slice(b"meta");
+    udta.extend_from_slice(&meta_payload);
+
+    let mut moov = Vec::new();
+    moov.extend_from_slice(&((8 + udta.len()) as u32).to_be_bytes());
+    moov.extend_from_slice(b"moov");
+    moov.extend_from_slice(&udta);
+
+    let mut out = ftyp;
+    out.extend_from_slice(&mdat);
+    out.extend_from_slice(&moov);
+    out
+}
+
+#[test]
+fn large_batch_planning_skips_full_hashing_for_unique_sizes_and_seeks_video_dates() {
+    use sha2::{Digest, Sha256};
+
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+
+    // 250 photos of distinct byte sizes: none should require full SHA-256 or sample reads at plan time.
+    let base_exif = exif_jpeg("2026:11:15");
+    for idx in 0..250usize {
+        let mut payload = base_exif.clone();
+        payload.resize(base_exif.len() + 4096 + idx * 17, (idx & 0xFF) as u8);
+        fs::write(source.path().join(format!("IMG_{idx:04}.JPG")), &payload).unwrap();
+    }
+    // Two identical files sharing size -> detected lazily via quick_fingerprint.
+    let dup_payload = vec![0x5Au8; 200 * 1024];
+    fs::write(source.path().join("DUP_A.ARW"), &dup_payload).unwrap();
+    fs::write(source.path().join("DUP_B.ARW"), &dup_payload).unwrap();
+
+    // Video formats (.mp4 with trailing moov past 1 MiB mdat, .m4v, .webm, .3gp).
+    let mp4 = synthetic_mp4_with_trailing_moov("2026-11-14T18:22:10+0800", 1_200_000);
+    let expected_mp4_sha = hex::encode(Sha256::digest(&mp4));
+    fs::write(source.path().join("CLIP_0001.MP4"), &mp4).unwrap();
+    fs::write(source.path().join("CLIP_0002.m4v"), b"m4v-bytes-1").unwrap();
+    fs::write(source.path().join("CLIP_0003.webm"), b"webm-bytes-12").unwrap();
+    fs::write(source.path().join("CLIP_0004.3gp"), b"3gp-bytes-123").unwrap();
+
+    let mut service = IngestService::open(state.path()).unwrap();
+    let started = std::time::Instant::now();
+    let plan = service
+        .plan(source.path(), destination.path(), "date", true)
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed.as_secs_f64() < 3.0,
+        "planning 256 files took too long: {elapsed:?}"
+    );
+    assert_eq!(plan.items.len(), 256);
+    assert_eq!(plan.duplicate_count, 1);
+
+    // Unique-sized items never compute full SHA-256 or quick_fingerprint during planning.
+    let unique_img = plan
+        .items
+        .iter()
+        .find(|item| item.source_relative_path == "IMG_0042.JPG")
+        .unwrap();
+    assert!(unique_img.sha256.is_empty());
+    assert!(unique_img.quick_fingerprint.is_empty());
+    assert_eq!(unique_img.relative_path, "2026-11-15/IMG_0042.JPG");
+
+    // Trailing-moov MP4 past 1.2 MB mdat resolves its capture date via seek.
+    let clip = plan
+        .items
+        .iter()
+        .find(|item| item.source_relative_path == "CLIP_0001.MP4")
+        .unwrap();
+    assert_eq!(clip.relative_path, "2026-11-14/CLIP_0001.MP4");
+    assert_eq!(clip.date_source, "exif");
+
+    let result = service.execute(&plan.id).unwrap();
+    assert_eq!(result.status, "completed");
+    assert_eq!(result.copied, 255);
+    assert_eq!(result.duplicates, 1);
+    let copied_clip = result
+        .items
+        .iter()
+        .find(|item| item.source.ends_with("CLIP_0001.MP4"))
+        .unwrap();
+    assert_eq!(
+        copied_clip.sha256.as_deref(),
+        Some(expected_mp4_sha.as_str())
+    );
+}
+
+#[test]
+fn video_type_split_and_include_videos_filter_behave_cleanly() {
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let history = tempfile::tempdir().unwrap();
+    fs::create_dir_all(source.path().join("DCIM/100NIKON")).unwrap();
+    fs::create_dir_all(source.path().join("PRIVATE/M4ROOT/CLIP")).unwrap();
+
+    fs::write(source.path().join("DCIM/100NIKON/DSC_0001.NEF"), b"raw").unwrap();
+    fs::write(source.path().join("DCIM/100NIKON/DSC_0001.xmp"), b"<x/>").unwrap();
+    fs::write(
+        source.path().join("PRIVATE/M4ROOT/CLIP/C0001.MP4"),
+        b"video-mp4",
+    )
+    .unwrap();
+    fs::write(source.path().join("PRIVATE/M4ROOT/CLIP/C0001.xmp"), b"<v/>").unwrap();
+
+    let mut service = IngestService::open(history.path()).unwrap();
+
+    // 1. With `type_split: by_kind` and `include_videos: true` (default), video + its .xmp go to `VIDEO/`.
+    let rules_with_video: neb_ingest::OrganizeRules = serde_json::from_value(serde_json::json!({
+        "date_basis": "import",
+        "type_split": "by_kind"
+    }))
+    .unwrap();
+    let plan_all = service
+        .plan_with_options(
+            source.path(),
+            destination.path(),
+            &rules_with_video,
+            true,
+            None,
+        )
+        .unwrap();
+    assert_eq!(plan_all.items.len(), 4);
+    assert!(plan_all
+        .items
+        .iter()
+        .any(|i| i.relative_path.ends_with("/VIDEO/C0001.MP4")));
+    assert!(plan_all
+        .items
+        .iter()
+        .any(|i| i.relative_path.ends_with("/VIDEO/C0001.xmp")));
+    assert!(plan_all
+        .items
+        .iter()
+        .any(|i| i.relative_path.ends_with("/RAW/DSC_0001.NEF")));
+    assert!(plan_all
+        .items
+        .iter()
+        .any(|i| i.relative_path.ends_with("/RAW/DSC_0001.xmp")));
+
+    // 2. With `include_videos: false`, both the video and its video-only `.xmp` are skipped, while photo + photo `.xmp` remain.
+    let rules_photos_only: neb_ingest::OrganizeRules = serde_json::from_value(serde_json::json!({
+        "date_basis": "import",
+        "type_split": "by_kind",
+        "include_videos": false
+    }))
+    .unwrap();
+    let plan_photos = service
+        .plan_with_options(
+            source.path(),
+            destination.path(),
+            &rules_photos_only,
+            true,
+            None,
+        )
+        .unwrap();
+    assert_eq!(plan_photos.items.len(), 2);
+    assert!(plan_photos.items.iter().all(|i| i
+        .source_relative_path
+        .starts_with("DCIM/100NIKON/DSC_0001.")));
+}

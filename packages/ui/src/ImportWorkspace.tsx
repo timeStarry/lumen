@@ -836,6 +836,18 @@ export default function ImportWorkspace(props: {
                     />
                   </Show>
                   <ListRow
+                    title="包含视频文件"
+                    description="一并扫描并导入 MP4 / MOV / MTS 等视频片段"
+                    control={
+                      <Switch
+                        label="包含视频文件"
+                        checked={rules().include_videos !== false}
+                        onChange={(on) => updateRules({ include_videos: on })}
+                        disabled={!!busy()}
+                      />
+                    }
+                  />
+                  <ListRow
                     title="跳过图片库里已有的照片"
                     description="按文件内容判断，同名不同内容会另存"
                     control={
@@ -957,7 +969,7 @@ export default function ImportWorkspace(props: {
                   />
                   <ListRow
                     title="按类型分目录"
-                    description="RAW / JPG / TIFF / OTHER，XMP 跟随 RAW"
+                    description="RAW / JPG / TIFF / VIDEO / OTHER，伴随 .xmp 跟随主文件"
                     control={
                       <Switch
                         label="按类型分目录"
