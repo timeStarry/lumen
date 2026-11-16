@@ -2815,7 +2815,10 @@ mod inspection_cache_tests {
         let report = core.scan(&library.id).unwrap();
         assert_eq!(report.indexed, 1);
         let listed = core
-            .dispatch("asset.list", json!({"library_id": library.id, "format": "video"}))
+            .dispatch(
+                "asset.list",
+                json!({"library_id": library.id, "format": "video"}),
+            )
             .unwrap();
         assert_eq!(listed["total"], 1);
         assert_eq!(listed["items"][0]["kind"], "video");

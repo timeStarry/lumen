@@ -813,9 +813,7 @@ impl StorageRegistry {
         &self,
         id: &str,
         key: &str,
-    ) -> Result<
-        impl FnOnce(u64, u64) -> Result<MediaSlice>,
-    > {
+    ) -> Result<impl FnOnce(u64, u64) -> Result<MediaSlice>> {
         validate_key(key, false)?;
         let config = self.config(id)?.clone();
         let key_owned = key.to_owned();
@@ -851,12 +849,20 @@ impl StorageRegistry {
                     total_len,
                     partial: true,
                 })
-            }) as Box<dyn FnOnce(u64, u64) -> Result<MediaSlice>>);
+            })
+                as Box<dyn FnOnce(u64, u64) -> Result<MediaSlice>>);
         }
         let credentials = self.credentials_for(&config)?;
         let client = self.client(&config)?;
         Ok(Box::new(move |start: u64, end_inclusive: u64| {
-            remote::read_media_slice(&client, &config, &credentials, &key_owned, start, end_inclusive)
+            remote::read_media_slice(
+                &client,
+                &config,
+                &credentials,
+                &key_owned,
+                start,
+                end_inclusive,
+            )
         }))
     }
 
@@ -894,7 +900,9 @@ impl StorageRegistry {
                         if s >= total_len {
                             bail!("E_RANGE_UNSATISFIABLE:{total_len}");
                         }
-                        let e = opt_e.map(|req| req.min(total_len - 1)).unwrap_or(total_len - 1);
+                        let e = opt_e
+                            .map(|req| req.min(total_len - 1))
+                            .unwrap_or(total_len - 1);
                         if e < s {
                             bail!("E_RANGE_UNSATISFIABLE:{total_len}");
                         }

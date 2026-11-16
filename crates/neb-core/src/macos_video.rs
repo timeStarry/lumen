@@ -78,7 +78,9 @@ pub(crate) fn extract_poster_frame(
     path: &Path,
     max_side: u32,
 ) -> Result<(DynamicImage, Option<Vec<u8>>)> {
-    let text = path.to_str().context("E_PATH: Video path is not valid UTF-8")?;
+    let text = path
+        .to_str()
+        .context("E_PATH: Video path is not valid UTF-8")?;
     let limit = max_side.clamp(64, 4096) as f64;
 
     autoreleasepool(|_| {

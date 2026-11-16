@@ -262,10 +262,7 @@ fn concurrent_remote_import_streams_without_get_readback_and_records_sha256() {
                 let mut first = lines.next().unwrap().split(' ');
                 let method = first.next().unwrap().to_owned();
                 let path = first.next().unwrap().to_owned();
-                methods
-                    .lock()
-                    .unwrap()
-                    .push((method.clone(), path.clone()));
+                methods.lock().unwrap().push((method.clone(), path.clone()));
                 if method == "GET" {
                     let _ = write!(
                         stream,

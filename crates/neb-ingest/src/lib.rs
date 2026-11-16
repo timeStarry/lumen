@@ -371,7 +371,8 @@ impl IngestService {
             needs_quick_fp: bool,
         }
 
-        let mut planned_targets: Vec<Option<PlannedTarget>> = Vec::with_capacity(source_files.len());
+        let mut planned_targets: Vec<Option<PlannedTarget>> =
+            Vec::with_capacity(source_files.len());
         for entry in &source_files {
             let preserve_name = preserve_names.contains(&entry.key);
             if preserve_name {
@@ -398,8 +399,8 @@ impl IngestService {
                                 .iter()
                                 .any(|c| same_dedup_role(&relative_path, c, preserve_name))
                         });
-                    let has_batch_collision =
-                        deduplicate && source_size_counts.get(&entry.size).copied().unwrap_or(0) > 1;
+                    let has_batch_collision = deduplicate
+                        && source_size_counts.get(&entry.size).copied().unwrap_or(0) > 1;
                     planned_targets.push(Some(PlannedTarget {
                         relative_path,
                         date_source,
@@ -908,12 +909,10 @@ impl IngestService {
                 Ok((relative_path, date_source)) => {
                     let target = join_key(&prefix, &relative_path);
                     let needs_full_sha = deduplicate
-                        && known_hashed_by_size
-                            .get(&entry.size)
-                            .is_some_and(|list| {
-                                list.iter()
-                                    .any(|asset| same_dedup_role(&target, &asset.key, preserve_name))
-                            });
+                        && known_hashed_by_size.get(&entry.size).is_some_and(|list| {
+                            list.iter()
+                                .any(|asset| same_dedup_role(&target, &asset.key, preserve_name))
+                        });
                     let needs_quick_fp = deduplicate
                         && source_size_counts.get(&entry.size).copied().unwrap_or(0) > 1;
                     targets.push(Some(RemoteTarget {
@@ -946,7 +945,8 @@ impl IngestService {
                     .then_some(idx)
             })
             .collect();
-        let full_hashes = compute_source_fingerprints(&source_scope, &source_files, &full_jobs, true);
+        let full_hashes =
+            compute_source_fingerprints(&source_scope, &source_files, &full_jobs, true);
         let quick_hashes =
             compute_source_fingerprints(&source_scope, &source_files, &quick_only_jobs, false);
 
@@ -985,15 +985,12 @@ impl IngestService {
             let mut duplicate_path = None;
             if deduplicate {
                 if !sha256.is_empty() {
-                    if let Some(asset) = known_hashed_by_size
-                        .get(&entry.size)
-                        .and_then(|list| {
-                            list.iter().find(|asset| {
-                                asset.sha256.as_deref() == Some(sha256.as_str())
-                                    && same_dedup_role(&t.target, &asset.key, t.preserve_name)
-                            })
+                    if let Some(asset) = known_hashed_by_size.get(&entry.size).and_then(|list| {
+                        list.iter().find(|asset| {
+                            asset.sha256.as_deref() == Some(sha256.as_str())
+                                && same_dedup_role(&t.target, &asset.key, t.preserve_name)
                         })
-                    {
+                    }) {
                         status = "duplicate";
                         duplicate_path = Some(asset.key.clone());
                     }
@@ -1007,8 +1004,7 @@ impl IngestService {
                 };
                 if status == "pending" {
                     if let Some(token) = batch_token {
-                        let identity =
-                            dedup_identity(&t.relative_path, token, t.preserve_name);
+                        let identity = dedup_identity(&t.relative_path, token, t.preserve_name);
                         if let Some(existing) = batch_fps.get(&identity) {
                             status = "duplicate";
                             duplicate_path = Some(existing.clone());
@@ -1020,7 +1016,9 @@ impl IngestService {
                         .file_name()
                         .map(|name| name.to_string_lossy().to_lowercase())
                         .unwrap_or_default();
-                    let day = capture_dates.get(&entry.key).and_then(|(day, _)| day.clone());
+                    let day = capture_dates
+                        .get(&entry.key)
+                        .and_then(|(day, _)| day.clone());
                     if let Some(day) = day {
                         if let Some(asset) = by_name.get(&(filename, entry.size)).and_then(|list| {
                             list.iter().find(|asset| {
@@ -1035,9 +1033,9 @@ impl IngestService {
                 }
                 if let Some(token) = batch_token {
                     let identity = dedup_identity(&t.relative_path, token, t.preserve_name);
-                    batch_fps
-                        .entry(identity)
-                        .or_insert_with(|| duplicate_path.clone().unwrap_or_else(|| t.target.clone()));
+                    batch_fps.entry(identity).or_insert_with(|| {
+                        duplicate_path.clone().unwrap_or_else(|| t.target.clone())
+                    });
                 }
             }
 
@@ -2045,17 +2043,19 @@ fn discover(
     Ok(DiscoveredFiles { files, unavailable })
 }
 
+type SourceFingerprintOutcome = Result<(String, Option<String>)>;
+
 fn compute_source_fingerprints(
     source_scope: &ScopedSource,
     files: &[DiscoveredFile],
     job_indices: &[usize],
     include_full_sha: bool,
-) -> HashMap<usize, Result<(String, Option<String>)>> {
+) -> HashMap<usize, SourceFingerprintOutcome> {
     if job_indices.is_empty() {
         return HashMap::new();
     }
     let next = AtomicUsize::new(0);
-    let out: Mutex<HashMap<usize, Result<(String, Option<String>)>>> =
+    let out: Mutex<HashMap<usize, SourceFingerprintOutcome>> =
         Mutex::new(HashMap::with_capacity(job_indices.len()));
     let workers = job_indices.len().clamp(1, FINGERPRINT_CONCURRENCY);
     std::thread::scope(|scope| {
@@ -2093,9 +2093,7 @@ fn compute_source_fingerprints(
                     }
                     Ok((quick, full))
                 })();
-                out.lock()
-                    .expect("fingerprint map lock")
-                    .insert(idx, res);
+                out.lock().expect("fingerprint map lock").insert(idx, res);
             });
         }
     });
@@ -2389,17 +2387,27 @@ fn copy_to_backup(
     known_sha256: Option<&str>,
     fp_cache: &mut HashMap<String, String>,
 ) -> Result<bool> {
-    let expected = known_sha256.or_else(|| (!item.sha256.is_empty()).then_some(item.sha256.as_str()));
+    let expected =
+        known_sha256.or_else(|| (!item.sha256.is_empty()).then_some(item.sha256.as_str()));
     if !backup_scoped.exists(&item.relative_path)? {
         let mut reader = VerifiedSourceReader::open(source_scope, item)?;
         backup_scoped.publish(&mut reader, &item.relative_path, expected)?;
         return Ok(true);
     }
-    if existing_matches(source_scope, backup_scoped, &item.relative_path, item, fp_cache) {
+    if existing_matches(
+        source_scope,
+        backup_scoped,
+        &item.relative_path,
+        item,
+        fp_cache,
+    ) {
         return Ok(false);
     }
     if preserve_name {
-        bail!("Backup conflict in XMP companion group at {}", item.relative_path);
+        bail!(
+            "Backup conflict in XMP companion group at {}",
+            item.relative_path
+        );
     }
     let suffix_sha = match expected {
         Some(sha) => sha.to_owned(),
@@ -2469,7 +2477,9 @@ fn companion_names(files: &[String], unavailable: &[String]) -> HashSet<String> 
     files
         .iter()
         .chain(unavailable)
-        .filter(|key| (is_pairable(key) || is_video_key(key)) && sidecars.contains(&capture_group(key)))
+        .filter(|key| {
+            (is_pairable(key) || is_video_key(key)) && sidecars.contains(&capture_group(key))
+        })
         .cloned()
         .collect()
 }

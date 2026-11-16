@@ -1301,13 +1301,10 @@ impl Service {
             });
         }
 
-        let key = asset
-            .source_key
-            .as_deref()
-            .ok_or_else(|| CommandError {
-                code: "E_INVALID",
-                message: "E_INVALID: Missing remote source key".into(),
-            })?;
+        let key = asset.source_key.as_deref().ok_or_else(|| CommandError {
+            code: "E_INVALID",
+            message: "E_INVALID: Missing remote source key".into(),
+        })?;
         let library = self
             .core
             .library(&asset.library_id)
@@ -1512,13 +1509,10 @@ impl Service {
             });
         }
 
-        let key = asset
-            .source_key
-            .as_deref()
-            .ok_or_else(|| CommandError {
-                code: "E_INVALID",
-                message: "E_INVALID: Missing remote source key".into(),
-            })?;
+        let key = asset.source_key.as_deref().ok_or_else(|| CommandError {
+            code: "E_INVALID",
+            message: "E_INVALID: Missing remote source key".into(),
+        })?;
         let library = self
             .core
             .library(&asset.library_id)

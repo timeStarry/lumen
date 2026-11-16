@@ -729,7 +729,10 @@ fn large_batch_planning_skips_full_hashing_for_unique_sizes_and_seeks_video_date
         .iter()
         .find(|item| item.source.ends_with("CLIP_0001.MP4"))
         .unwrap();
-    assert_eq!(copied_clip.sha256.as_deref(), Some(expected_mp4_sha.as_str()));
+    assert_eq!(
+        copied_clip.sha256.as_deref(),
+        Some(expected_mp4_sha.as_str())
+    );
 }
 
 #[test]
@@ -747,11 +750,7 @@ fn video_type_split_and_include_videos_filter_behave_cleanly() {
         b"video-mp4",
     )
     .unwrap();
-    fs::write(
-        source.path().join("PRIVATE/M4ROOT/CLIP/C0001.xmp"),
-        b"<v/>",
-    )
-    .unwrap();
+    fs::write(source.path().join("PRIVATE/M4ROOT/CLIP/C0001.xmp"), b"<v/>").unwrap();
 
     let mut service = IngestService::open(history.path()).unwrap();
 
@@ -805,8 +804,7 @@ fn video_type_split_and_include_videos_filter_behave_cleanly() {
         )
         .unwrap();
     assert_eq!(plan_photos.items.len(), 2);
-    assert!(plan_photos
-        .items
-        .iter()
-        .all(|i| i.source_relative_path.starts_with("DCIM/100NIKON/DSC_0001.")));
+    assert!(plan_photos.items.iter().all(|i| i
+        .source_relative_path
+        .starts_with("DCIM/100NIKON/DSC_0001.")));
 }

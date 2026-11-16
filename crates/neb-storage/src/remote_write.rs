@@ -222,8 +222,9 @@ impl RemoteWriter {
         self.track(match self.config.kind.as_str() {
             "webdav" => self.dav_put_new(key, body, size, expected_sha256),
             "s3" => {
-                let sha256 = expected_sha256
-                    .ok_or_else(|| anyhow::anyhow!("E_INVALID: S3 uploads require payload SHA-256"))?;
+                let sha256 = expected_sha256.ok_or_else(|| {
+                    anyhow::anyhow!("E_INVALID: S3 uploads require payload SHA-256")
+                })?;
                 self.s3_put_new(key, body, size, sha256)?;
                 Ok(sha256.to_owned())
             }

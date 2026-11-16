@@ -308,9 +308,7 @@ pub(crate) fn read_media_slice(
         let actual_start: u64 = s_str.trim().parse()?;
         let actual_end: u64 = e_str.trim().parse()?;
         let total_len: u64 = total_str.trim().parse().unwrap_or(actual_end + 1);
-        if actual_end < actual_start
-            || actual_end - actual_start + 1 > MAX_MEDIA_SLICE_BYTES
-        {
+        if actual_end < actual_start || actual_end - actual_start + 1 > MAX_MEDIA_SLICE_BYTES {
             bail!("E_LIMIT: Remote media slice exceeds bounded chunk limit");
         }
         let expected = (actual_end - actual_start + 1) as usize;

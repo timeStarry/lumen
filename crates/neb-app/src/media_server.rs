@@ -207,7 +207,11 @@ fn is_client_disconnect(kind: io::ErrorKind) -> bool {
     )
 }
 
-fn handle_connection(mut stream: TcpStream, service: &Service, expected_token: &str) -> io::Result<()> {
+fn handle_connection(
+    mut stream: TcpStream,
+    service: &Service,
+    expected_token: &str,
+) -> io::Result<()> {
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
@@ -323,7 +327,10 @@ fn handle_connection(mut stream: TcpStream, service: &Service, expected_token: &
         let mut extra = vec![
             ("Accept-Ranges", "bytes".into()),
             ("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS".into()),
-            ("Access-Control-Allow-Headers", "Range, If-None-Match".into()),
+            (
+                "Access-Control-Allow-Headers",
+                "Range, If-None-Match".into(),
+            ),
             (
                 "Access-Control-Expose-Headers",
                 "Accept-Ranges, Content-Range, Content-Length".into(),
@@ -333,7 +340,13 @@ fn handle_connection(mut stream: TcpStream, service: &Service, expected_token: &
             extra.push(("Access-Control-Allow-Origin", origin.to_owned()));
             extra.push(("Vary", "Origin".into()));
         }
-        return write_simple_response(&mut stream, StatusCode::NO_CONTENT, "text/plain", &extra, &[]);
+        return write_simple_response(
+            &mut stream,
+            StatusCode::NO_CONTENT,
+            "text/plain",
+            &extra,
+            &[],
+        );
     }
 
     let head_only = method.eq_ignore_ascii_case("HEAD");
@@ -375,11 +388,12 @@ fn handle_connection(mut stream: TcpStream, service: &Service, expected_token: &
     let media = match service.open_media_stream(id, range, head_only) {
         Ok(m) => m,
         Err(err) if err.code == "E_RANGE_UNSATISFIABLE" => {
-            let total = if err.message.is_empty() || !err.message.bytes().all(|b| b.is_ascii_digit()) {
-                "*"
-            } else {
-                err.message.as_str()
-            };
+            let total =
+                if err.message.is_empty() || !err.message.bytes().all(|b| b.is_ascii_digit()) {
+                    "*"
+                } else {
+                    err.message.as_str()
+                };
             let mut extra = vec![
                 ("Accept-Ranges", "bytes".into()),
                 ("Content-Range", format!("bytes */{total}")),
@@ -428,7 +442,9 @@ fn handle_connection(mut stream: TcpStream, service: &Service, expected_token: &
         ));
     }
     if let Some(origin) = cors_origin {
-        header_block.push_str(&format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n"));
+        header_block.push_str(&format!(
+            "Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n"
+        ));
     }
     header_block.push_str("\r\n");
 

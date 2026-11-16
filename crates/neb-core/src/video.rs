@@ -30,6 +30,7 @@ pub const VIDEO_EXTENSIONS: &[&str] = &[
 const QUICKTIME_EPOCH_OFFSET: u64 = 2_082_844_800;
 const MAX_VIDEO_META_READ_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_EMBEDDED_JPEG_BYTES: u64 = 2 * 1024 * 1024;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const MAX_FIRST_SAMPLE_BYTES: u32 = 2 * 1024 * 1024;
 const MAX_BOXES: usize = 2048;
 
@@ -85,7 +86,10 @@ pub(crate) fn inspect_reader<R: Read + Seek>(
     length: u64,
     ext: &str,
 ) -> Result<Inspection> {
-    ensure!(length >= 12, "E_UNSUPPORTED_CODEC: Video file is empty or truncated");
+    ensure!(
+        length >= 12,
+        "E_UNSUPPORTED_CODEC: Video file is empty or truncated"
+    );
     let ext_lower = ext.trim_start_matches('.').to_ascii_lowercase();
     let mut head = [0_u8; 16];
     let head_len = length.min(16) as usize;
@@ -184,7 +188,10 @@ impl<R: Read + Seek> BmffCursor<'_, R> {
             return Ok(None);
         }
         self.boxes_seen += 1;
-        ensure!(self.boxes_seen <= MAX_BOXES, "E_LIMIT: Too many ISO-BMFF boxes");
+        ensure!(
+            self.boxes_seen <= MAX_BOXES,
+            "E_LIMIT: Too many ISO-BMFF boxes"
+        );
         let head = self.read_slice(cursor, 8)?;
         let size32 = u32::from_be_bytes([head[0], head[1], head[2], head[3]]);
         let kind = [head[4], head[5], head[6], head[7]];
@@ -219,6 +226,7 @@ impl<R: Read + Seek> BmffCursor<'_, R> {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Clone)]
 struct FirstVideoSample {
     tkhd_box: Vec<u8>,
@@ -254,6 +262,7 @@ struct BmffVideoInfo {
     first_sample: Option<FirstVideoSample>,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct BmffDetail {
     inspection: Inspection,
     rotation_degrees: u16,
@@ -308,7 +317,7 @@ fn inspect_bmff_detail<R: Read + Seek>(
     );
 
     // Prefer largest embedded preview (e.g. Nikon NCM1/NCVW 640p..1080p) ahead of tiny NCTH 160x120.
-    info.embedded_jpegs.sort_by(|a, b| b.1.cmp(&a.1));
+    info.embedded_jpegs.sort_by_key(|a| std::cmp::Reverse(a.1));
     info.embedded_jpegs.dedup();
 
     // Supplement missing camera/lens/exposure fields from the embedded preview JPEG's APP1 EXIF header.
@@ -373,12 +382,18 @@ fn inspect_bmff_detail<R: Read + Seek>(
         }
     }
     if !metadata.contains_key("Captured") {
-        if let Some(qt_secs) = info.mvhd_creation_qt.filter(|v| *v > QUICKTIME_EPOCH_OFFSET) {
+        if let Some(qt_secs) = info
+            .mvhd_creation_qt
+            .filter(|v| *v > QUICKTIME_EPOCH_OFFSET)
+        {
             let unix_secs = (qt_secs - QUICKTIME_EPOCH_OFFSET) as i64;
             // Guard against implausible dates before 1980 or far future (> 2100).
             if (315_532_800..=4_102_444_800).contains(&unix_secs) {
                 if let Some(dt) = DateTime::from_timestamp(unix_secs, 0) {
-                    metadata.insert("Captured".into(), dt.format("%Y:%m:%d %H:%M:%S").to_string());
+                    metadata.insert(
+                        "Captured".into(),
+                        dt.format("%Y:%m:%d %H:%M:%S").to_string(),
+                    );
                 }
             }
         }
@@ -427,7 +442,7 @@ pub(crate) fn extract_remote_poster_and_inspect<R: Read + Seek>(
 
         // Tier 1: Camera-embedded cover JPEG inside `moov` / `udta` / `meta`.
         for &(offset, len) in &detail.embedded_jpegs {
-            if len < 64 || len > MAX_EMBEDDED_JPEG_BYTES {
+            if !(64..=MAX_EMBEDDED_JPEG_BYTES).contains(&len) {
                 continue;
             }
             let Some(end) = offset.checked_add(len) else {
@@ -845,10 +860,21 @@ fn parse_tkhd<R: Read + Seek>(
         return Ok(());
     }
     let a = i32::from_be_bytes(data[matrix_offset..matrix_offset + 4].try_into().unwrap());
-    let b_mat = i32::from_be_bytes(data[matrix_offset + 4..matrix_offset + 8].try_into().unwrap());
-    let c_mat =
-        i32::from_be_bytes(data[matrix_offset + 12..matrix_offset + 16].try_into().unwrap());
-    let d = i32::from_be_bytes(data[matrix_offset + 16..matrix_offset + 20].try_into().unwrap());
+    let b_mat = i32::from_be_bytes(
+        data[matrix_offset + 4..matrix_offset + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let c_mat = i32::from_be_bytes(
+        data[matrix_offset + 12..matrix_offset + 16]
+            .try_into()
+            .unwrap(),
+    );
+    let d = i32::from_be_bytes(
+        data[matrix_offset + 16..matrix_offset + 20]
+            .try_into()
+            .unwrap(),
+    );
     track.rotation_degrees = if a == 0 && d == 0 {
         if b_mat > 0 && c_mat < 0 {
             90
@@ -1674,13 +1700,7 @@ fn apply_exif_creation_date(raw: &str, metadata: &mut BTreeMap<String, String>) 
         && b[13] == b':'
         && b[16] == b':'
     {
-        let normalized = format!(
-            "{}:{}:{} {}",
-            &s[0..4],
-            &s[5..7],
-            &s[8..10],
-            &s[11..19]
-        );
+        let normalized = format!("{}:{}:{} {}", &s[0..4], &s[5..7], &s[8..10], &s[11..19]);
         if normalized
             .bytes()
             .enumerate()
@@ -1724,10 +1744,7 @@ fn apply_iso_creation_date(raw: &str, metadata: &mut BTreeMap<String, String>) {
 
     let mut rest = &s[19..];
     if let Some(after_dot) = rest.strip_prefix('.') {
-        let digits: String = after_dot
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect();
+        let digits: String = after_dot.chars().take_while(char::is_ascii_digit).collect();
         if !digits.is_empty() {
             metadata.insert("Capture Subsecond".into(), digits.clone());
         }
@@ -1821,10 +1838,8 @@ fn inspect_avi<R: Read + Seek>(input: &mut R, length: u64, ext: &str) -> Result<
     if let Some(pos) = buf.windows(4).position(|w| w == b"avih") {
         // avih chunk: [b"avih", u32 size, u32 micro_sec_per_frame, ..., u32 total_frames (offset+24), ..., u32 width (offset+40), u32 height (offset+44)]
         if pos + 48 <= buf.len() {
-            let us_per_frame =
-                u32::from_le_bytes(buf[pos + 8..pos + 12].try_into().unwrap());
-            let total_frames =
-                u32::from_le_bytes(buf[pos + 24..pos + 28].try_into().unwrap());
+            let us_per_frame = u32::from_le_bytes(buf[pos + 8..pos + 12].try_into().unwrap());
+            let total_frames = u32::from_le_bytes(buf[pos + 24..pos + 28].try_into().unwrap());
             let w = u32::from_le_bytes(buf[pos + 40..pos + 44].try_into().unwrap());
             let h = u32::from_le_bytes(buf[pos + 44..pos + 48].try_into().unwrap());
             if (16..=16_384).contains(&w) && (16..=16_384).contains(&h) {
@@ -2148,10 +2163,7 @@ mod tests {
         assert_eq!(source, "video_embedded_jpeg");
         assert_eq!(info.metadata["Make"], "NIKON CORPORATION");
         assert_eq!(info.metadata["Camera"], "NIKON Z 30");
-        assert_eq!(
-            info.metadata["Lens"],
-            "NIKKOR Z DX 16-50mm f/3.5-6.3 VR"
-        );
+        assert_eq!(info.metadata["Lens"], "NIKKOR Z DX 16-50mm f/3.5-6.3 VR");
         assert_eq!(info.metadata["Focal Length"], "24 mm");
         assert_eq!(info.metadata["Aperture"], "f/4.5");
         assert_eq!(info.metadata["Exposure"], "1/60 s");

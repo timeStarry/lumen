@@ -54,7 +54,9 @@ fn parse_route(path: &str) -> Result<ProtocolRoute, &'static str> {
         if !valid_revision(rev) {
             return Err("Revision must be digits");
         }
-        return Ok(ProtocolRoute::Media(MediaRequest { id: (*id).to_owned() }));
+        return Ok(ProtocolRoute::Media(MediaRequest {
+            id: (*id).to_owned(),
+        }));
     }
     parse_request(path).map(ProtocolRoute::Preview)
 }
@@ -240,10 +242,7 @@ pub fn respond_media(
             .status(StatusCode::NO_CONTENT)
             .header(header::ACCEPT_RANGES, "bytes")
             .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-            .header(
-                header::ACCESS_CONTROL_ALLOW_HEADERS,
-                "Range, If-None-Match",
-            )
+            .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "Range, If-None-Match")
             .header(
                 header::ACCESS_CONTROL_EXPOSE_HEADERS,
                 "Accept-Ranges, Content-Range, Content-Length",
@@ -596,7 +595,10 @@ mod tests {
             .execute("library.scan", json!({"library_id": lib["id"]}))
             .unwrap();
         let listed = service
-            .execute("asset.list", json!({"library_id": lib["id"], "format": "video"}))
+            .execute(
+                "asset.list",
+                json!({"library_id": lib["id"], "format": "video"}),
+            )
             .unwrap();
         let id = listed["items"][0]["id"].as_str().unwrap();
 
@@ -627,7 +629,11 @@ mod tests {
         assert_eq!(suffix.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(
             suffix.headers()[header::CONTENT_RANGE],
-            format!("bytes {}-{}/{expected_len}", expected_len - 10, expected_len - 1)
+            format!(
+                "bytes {}-{}/{expected_len}",
+                expected_len - 10,
+                expected_len - 1
+            )
         );
         assert_eq!(suffix.body(), &clip_bytes[expected_len - 10..]);
 
