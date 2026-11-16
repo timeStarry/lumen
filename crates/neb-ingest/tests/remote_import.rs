@@ -232,6 +232,155 @@ fn unverified_name_matches_are_skipped_unless_included() {
     assert_eq!(included.copied, 1);
 }
 
+#[test]
+fn concurrent_remote_import_streams_without_get_readback_and_records_sha256() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let store: Store = Arc::default();
+    let methods: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let shared_store = store.clone();
+    let shared_methods = methods.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let store = shared_store.clone();
+            let methods = shared_methods.clone();
+            thread::spawn(move || {
+                let mut stream = stream;
+                let mut data = Vec::new();
+                let mut buffer = [0u8; 8192];
+                let end = loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => data.extend_from_slice(&buffer[..n]),
+                    }
+                    if let Some(i) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&data[..end]).to_string();
+                let mut lines = head.lines();
+                let mut first = lines.next().unwrap().split(' ');
+                let method = first.next().unwrap().to_owned();
+                let path = first.next().unwrap().to_owned();
+                methods
+                    .lock()
+                    .unwrap()
+                    .push((method.clone(), path.clone()));
+                if method == "GET" {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    return;
+                }
+                drop(lines);
+                drop(head);
+                // Re-dispatch is unnecessary: inline minimal WebDAV store handling.
+                let head_str = String::from_utf8_lossy(&data[..end]).to_string();
+                let headers: HashMap<String, String> = head_str
+                    .lines()
+                    .skip(1)
+                    .filter_map(|l| l.split_once(':'))
+                    .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_owned()))
+                    .collect();
+                let length: usize = headers
+                    .get("content-length")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let mut body = data[end..].to_vec();
+                while body.len() < length {
+                    let n = stream.read(&mut buffer).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&buffer[..n]);
+                }
+                let mut files = store.lock().unwrap();
+                let status = match method.as_str() {
+                    "MKCOL" => "201 Created",
+                    "DELETE" => {
+                        files.remove(&path);
+                        "204 No Content"
+                    }
+                    "PUT" if files.contains_key(&path) => "412 Precondition Failed",
+                    "PUT" => {
+                        files.insert(path, body);
+                        "201 Created"
+                    }
+                    "MOVE" => {
+                        let dest = headers["destination"]
+                            .splitn(4, '/')
+                            .nth(3)
+                            .map(|p| format!("/{p}"))
+                            .unwrap();
+                        if files.contains_key(&dest) {
+                            "412 Precondition Failed"
+                        } else {
+                            let bytes = files.remove(&path).unwrap_or_default();
+                            files.insert(dest, bytes);
+                            "201 Created"
+                        }
+                    }
+                    _ => "405 Method Not Allowed",
+                };
+                drop(files);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            });
+        }
+    });
+
+    let endpoint = format!("http://127.0.0.1:{port}/dav/");
+    let data = tempfile::tempdir().unwrap();
+    let card = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    for idx in 0..20usize {
+        let mut payload = vec![b'P'; 1024 + idx * 31];
+        payload[0] = idx as u8;
+        fs::write(card.path().join(format!("DSC_{idx:04}.NEF")), &payload).unwrap();
+    }
+
+    let mut registry = StorageRegistry::open(data.path()).unwrap();
+    let id = registry
+        .add(
+            serde_json::from_value(serde_json::json!({
+                "name":"NAS","kind":"webdav","endpoint":endpoint,"remember_credentials":false
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+        .id;
+    let rules: OrganizeRules =
+        serde_json::from_value(serde_json::json!({"date_basis":"import","subfolder":"Fast"}))
+            .unwrap();
+    let mut ingest = IngestService::open(state.path()).unwrap();
+    let plan = ingest
+        .plan_remote(card.path(), &id, "photos", &rules, true, &[])
+        .unwrap();
+    assert!(plan.items.iter().all(|i| i.sha256.is_empty()));
+
+    let writer = registry.open_writer(&id).unwrap();
+    let result = ingest.execute_remote(&plan.id, &writer, false).unwrap();
+    assert_eq!((result.copied, result.failed), (20, 0));
+    assert_eq!(store.lock().unwrap().len(), 20);
+    for item in &result.items {
+        let bytes = fs::read(&item.source).unwrap();
+        assert_eq!(item.sha256.as_deref(), Some(sha(&bytes).as_str()));
+    }
+    let logged = methods.lock().unwrap().clone();
+    assert!(
+        logged.iter().all(|(m, _)| m != "GET"),
+        "WebDAV import must never GET uploaded files back: {logged:?}"
+    );
+    let mkcol_count = logged.iter().filter(|(m, _)| m == "MKCOL").count();
+    assert_eq!(
+        mkcol_count, 3,
+        "photos / Fast / import_day MKCOL must be cached across concurrent workers: {logged:?}"
+    );
+}
+
 fn tiff(datetime: &str) -> Vec<u8> {
     // Little-endian TIFF: IFD0 with one ExifIFD pointer; Exif IFD with DateTimeOriginal.
     let mut value = datetime.as_bytes().to_vec();

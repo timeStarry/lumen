@@ -1,11 +1,11 @@
 //! Non-overwriting publication to WebDAV and S3.
 //!
-//! A write either lands at a key that did not exist, verified against the planned
-//! SHA-256, or fails without touching existing content. A server that cannot
-//! guarantee "do not overwrite" is refused rather than written to best-effort.
+//! A write either lands at a key that did not exist, or fails without touching
+//! existing content. A server that cannot guarantee "do not overwrite" is
+//! refused rather than written to best-effort.
 use crate::{
     availability::{classify, Availability, AvailabilityCell},
-    hash_reader, remote, validate_key, Credentials, StorageConfig,
+    remote, validate_key, Credentials, StorageConfig,
 };
 use anyhow::{bail, ensure, Result};
 use reqwest::{
@@ -27,6 +27,29 @@ use uuid::Uuid;
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 /// S3 single-request upload limit.
 const S3_SINGLE_PUT_LIMIT: u64 = 5 * 1024 * 1024 * 1024;
+
+struct StreamHashState {
+    bytes_read: u64,
+    hasher: Sha256,
+}
+
+struct HashingReader<R> {
+    inner: R,
+    state: Arc<Mutex<StreamHashState>>,
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.inner.read(buf)?;
+        if count > 0 {
+            if let Ok(mut guard) = self.state.lock() {
+                guard.bytes_read += count as u64;
+                guard.hasher.update(&buf[..count]);
+            }
+        }
+        Ok(count)
+    }
+}
 
 /// Whether a location has passed the explicit write test in this process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +96,7 @@ pub struct RemoteWriter {
     availability: Arc<AvailabilityCell>,
     capability: Arc<AtomicU8>,
     collections: Mutex<HashSet<String>>,
+    collection_gate: Mutex<()>,
 }
 
 fn code(error: &anyhow::Error) -> bool {
@@ -97,11 +121,16 @@ impl RemoteWriter {
             availability,
             capability,
             collections: Mutex::new(HashSet::new()),
+            collection_gate: Mutex::new(()),
         }
     }
 
     pub fn location_id(&self) -> &str {
         &self.config.id
+    }
+
+    pub fn kind(&self) -> &str {
+        &self.config.kind
     }
 
     pub fn capability(&self) -> WriteCapability {
@@ -156,8 +185,7 @@ impl RemoteWriter {
         })())
     }
 
-    /// Publish `body` at `key` only if nothing is there. `sha256` is the planned
-    /// hash; the server (S3) or a read-back (WebDAV) must confirm it.
+    /// Publish `body` at `key` only if nothing is there, verifying against `sha256`.
     pub fn put_new<R: Read + Send + 'static>(
         &self,
         key: &str,
@@ -170,9 +198,35 @@ impl RemoteWriter {
             sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_hexdigit()),
             "E_INVALID: A SHA-256 is required for remote publication"
         );
+        self.put_new_streaming(key, body, size, Some(sha256))
+            .map(|_| ())
+    }
+
+    /// Single-pass streaming publication returning the uploaded content's SHA-256.
+    /// WebDAV streams directly without pre-hashing or re-downloading the body; S3
+    /// requires `expected_sha256` to sign `x-amz-content-sha256`.
+    pub fn put_new_streaming<R: Read + Send + 'static>(
+        &self,
+        key: &str,
+        body: R,
+        size: u64,
+        expected_sha256: Option<&str>,
+    ) -> Result<String> {
+        validate_key(key, false)?;
+        if let Some(sha256) = expected_sha256 {
+            ensure!(
+                sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_hexdigit()),
+                "E_INVALID: Expected SHA-256 must be 64 lowercase/uppercase hex digits"
+            );
+        }
         self.track(match self.config.kind.as_str() {
-            "webdav" => self.dav_put_new(key, body, size, sha256),
-            "s3" => self.s3_put_new(key, body, size, sha256),
+            "webdav" => self.dav_put_new(key, body, size, expected_sha256),
+            "s3" => {
+                let sha256 = expected_sha256
+                    .ok_or_else(|| anyhow::anyhow!("E_INVALID: S3 uploads require payload SHA-256"))?;
+                self.s3_put_new(key, body, size, sha256)?;
+                Ok(sha256.to_owned())
+            }
             _ => bail!("E_UNSUPPORTED: Only WebDAV and S3 locations accept remote writes"),
         })
     }
@@ -196,6 +250,19 @@ impl RemoteWriter {
     }
 
     fn dav_collections(&self, directory: &str) -> Result<()> {
+        {
+            let known = self
+                .collections
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Writer state is unavailable"))?;
+            if known.contains(directory) {
+                return Ok(());
+            }
+        }
+        let _gate = self
+            .collection_gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Writer state is unavailable"))?;
         let mut prefix = String::new();
         for part in directory.split('/') {
             if !prefix.is_empty() {
@@ -233,8 +300,8 @@ impl RemoteWriter {
         key: &str,
         body: R,
         size: u64,
-        sha256: &str,
-    ) -> Result<()> {
+        expected_sha256: Option<&str>,
+    ) -> Result<String> {
         let parent = key.rsplit_once('/').map(|(parent, _)| parent);
         if let Some(parent) = parent {
             self.dav_collections(parent)?;
@@ -244,10 +311,18 @@ impl RemoteWriter {
             Some(parent) => format!("{parent}/{name}"),
             None => name,
         };
+        let hash_state = Arc::new(Mutex::new(StreamHashState {
+            bytes_read: 0,
+            hasher: Sha256::new(),
+        }));
+        let hashing_body = HashingReader {
+            inner: body,
+            state: hash_state.clone(),
+        };
         let uploaded = self
             .dav(Method::PUT, &temporary)?
             .header("If-None-Match", "*")
-            .body(Body::sized(body, size))
+            .body(Body::sized(hashing_body, size))
             .send()?;
         if !uploaded.status().is_success() {
             bail!(
@@ -255,13 +330,24 @@ impl RemoteWriter {
                 uploaded.status().as_u16()
             );
         }
-        let outcome = (|| -> Result<()> {
-            let response = remote::checked(self.dav(Method::GET, &temporary)?.send()?)?;
-            let (read, hash) = hash_reader(&mut response.take(size + 1))?;
+        let outcome = (|| -> Result<String> {
+            let (bytes_read, actual_hash) = {
+                let mut guard = hash_state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Upload hash state unavailable"))?;
+                let hasher = std::mem::take(&mut guard.hasher);
+                (guard.bytes_read, hex::encode(hasher.finalize()))
+            };
             ensure!(
-                read == size && hash == sha256,
-                "E_VERIFY: The uploaded file did not read back intact"
+                bytes_read == size,
+                "E_VERIFY: Source size changed during upload ({bytes_read} != {size})"
             );
+            if let Some(expected) = expected_sha256 {
+                ensure!(
+                    actual_hash.eq_ignore_ascii_case(expected),
+                    "E_VERIFY: Source content did not match planned SHA-256"
+                );
+            }
             let destination = remote::url_for(&self.config, key)?;
             let moved = self
                 .dav(Method::from_bytes(b"MOVE")?, &temporary)?
@@ -269,7 +355,7 @@ impl RemoteWriter {
                 .header("Overwrite", "F")
                 .send()?;
             match moved.status() {
-                status if status.is_success() => Ok(()),
+                status if status.is_success() => Ok(actual_hash),
                 StatusCode::PRECONDITION_FAILED => {
                     bail!("E_CONFLICT: {key} already exists on the server")
                 }

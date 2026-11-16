@@ -21,8 +21,8 @@ pub use snapshot_browser::StorageBrowser;
 pub use transport::{inspect_tls, TlsCertificateInfo};
 
 pub use safe::{
-    atomic_json, hash_reader, open_scoped, publish_reader, safe_join, validate_key,
-    PreparedDestination, ScopedDestination,
+    atomic_json, hash_reader, open_scoped, publish_reader, quick_fingerprint_reader, safe_join,
+    validate_key, PreparedDestination, ScopedDestination, ScopedSource,
 };
 
 use anyhow::{bail, Context, Result};
