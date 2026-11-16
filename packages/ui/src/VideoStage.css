@@ -5,7 +5,11 @@
   justify-content: center;
   width: 100%;
   height: 100%;
+  padding-top: var(--nl-h-lg);
+  padding-bottom: var(--cull-strip-height, 0px);
+  box-sizing: border-box;
   overflow: hidden;
+  cursor: default;
   background: var(--nl-v-stage);
 }
 

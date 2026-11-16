@@ -23,7 +23,7 @@ pub use pregenerate::PregenerateReport;
 mod cards;
 mod fingerprint;
 mod remote_cache;
-pub use remote_cache::{ByteRangeSpec, MediaChunk};
+pub use remote_cache::{ByteRangeSpec, MediaChunk, MediaStream};
 
 const PREVIEW_MEMORY_ENTRIES: usize = 1024;
 const PREVIEW_MEMORY_BYTES: usize = 192 * 1024 * 1024;

@@ -65,6 +65,26 @@ pub struct MediaChunk {
     pub partial: bool,
 }
 
+pub struct MediaStream {
+    pub reader: Option<Box<dyn Read + Send>>,
+    pub start: u64,
+    pub end: u64,
+    pub total_len: u64,
+    pub content_type: &'static str,
+    pub partial: bool,
+}
+
+struct LeasedReader<R> {
+    inner: R,
+    _lease: Option<CacheLease>,
+}
+
+impl<R: Read> Read for LeasedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DownloadPriority {
     /// Interactive viewer (`P2560` / `Full`): FIFO order + 1 dedicated burst slot
@@ -1015,6 +1035,9 @@ impl Service {
                 }
                 Ok(json!({"asset_id":id,"pinned":pinned,"stats":stats}))
             }
+            "asset.histogram" if asset.kind == "video" => {
+                bail!("E_UNSUPPORTED: 视频文件无静态像素直方图。");
+            }
             "asset.histogram" if asset.source_key.is_none() => {
                 // From the viewer tier the window already shows (cached on disk after the
                 // first view), then from memory: a RAW is never demosaiced twice for this.
@@ -1393,6 +1416,236 @@ impl Service {
                 slice.partial || range.is_some()
             },
         })
+    }
+
+    /// Opens an unbuffered byte-range stream for the loopback HTTP media server so
+    /// native `AVPlayer` / `WebView2` media decoders can seek `moov` atoms and stream
+    /// multi-gigabyte videos in `64 KiB` socket chunks without `WKURLSchemeHandler` buffering.
+    pub fn open_media_stream(
+        &self,
+        id: &str,
+        range: Option<ByteRangeSpec>,
+        head_only: bool,
+    ) -> std::result::Result<MediaStream, CommandError> {
+        let asset = self.core.asset(id).map_err(CommandError::from)?;
+        if asset.kind != "video" {
+            return Err(CommandError {
+                code: "E_UNSUPPORTED_CODEC",
+                message: "E_UNSUPPORTED_CODEC: Media stream is only available for video assets"
+                    .into(),
+            });
+        }
+        let content_type = neb_core::video::mime_type(&asset.extension);
+
+        let local_lease = if asset.source_key.is_some() {
+            self.current_original(&asset).ok().flatten()
+        } else {
+            None
+        };
+        if asset.source_key.is_none() || local_lease.is_some() {
+            let path = if let Some(ref lease) = local_lease {
+                lease.path().to_path_buf()
+            } else {
+                self.core
+                    .resolve_local_asset_path(&asset)
+                    .map_err(CommandError::from)?
+            };
+            let mut file = File::open(&path).map_err(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    CommandError {
+                        code: "E_OFFLINE",
+                        message: "E_OFFLINE: Original video file is unavailable".into(),
+                    }
+                } else {
+                    CommandError::from(anyhow::Error::from(err))
+                }
+            })?;
+            let total_len = file
+                .metadata()
+                .map_err(|e| CommandError::from(anyhow::Error::from(e)))?
+                .len();
+            if total_len == 0 {
+                if range.is_some() {
+                    return Err(CommandError {
+                        code: "E_RANGE_UNSATISFIABLE",
+                        message: "0".into(),
+                    });
+                }
+                return Ok(MediaStream {
+                    reader: if head_only {
+                        None
+                    } else {
+                        Some(Box::new(std::io::empty()))
+                    },
+                    start: 0,
+                    end: 0,
+                    total_len: 0,
+                    content_type,
+                    partial: false,
+                });
+            }
+            let (start, end, partial) = resolve_stream_range(range, total_len)?;
+            if head_only {
+                return Ok(MediaStream {
+                    reader: None,
+                    start,
+                    end,
+                    total_len,
+                    content_type,
+                    partial,
+                });
+            }
+            file.seek(SeekFrom::Start(start))
+                .map_err(|e| CommandError::from(anyhow::Error::from(e)))?;
+            let take_len = end - start + 1;
+            return Ok(MediaStream {
+                reader: Some(Box::new(LeasedReader {
+                    inner: file.take(take_len),
+                    _lease: local_lease,
+                })),
+                start,
+                end,
+                total_len,
+                content_type,
+                partial,
+            });
+        }
+
+        let key = asset
+            .source_key
+            .as_deref()
+            .ok_or_else(|| CommandError {
+                code: "E_INVALID",
+                message: "E_INVALID: Missing remote source key".into(),
+            })?;
+        let library = self
+            .core
+            .library(&asset.library_id)
+            .map_err(CommandError::from)?;
+        let source = library.storage_id.as_deref().ok_or_else(|| CommandError {
+            code: "E_NOT_FOUND",
+            message: "E_NOT_FOUND: Remote library has no storage source".into(),
+        })?;
+
+        if head_only && asset.size > 0 {
+            let (start, end, partial) = resolve_stream_range(range, asset.size)?;
+            return Ok(MediaStream {
+                reader: None,
+                start,
+                end,
+                total_len: asset.size,
+                content_type,
+                partial,
+            });
+        }
+
+        let open_remote = self
+            .storage
+            .lock()
+            .map_err(|_| CommandError {
+                code: "E_WORKER",
+                message: "Storage state unavailable".into(),
+            })?
+            .prepare_media_stream(source, key)
+            .map_err(CommandError::from)?;
+
+        let req = match range {
+            None => neb_storage::MediaRangeRequest::Full,
+            Some(ByteRangeSpec::FromTo(start, opt_end)) => {
+                if asset.size > 0 && start >= asset.size {
+                    return Err(CommandError {
+                        code: "E_RANGE_UNSATISFIABLE",
+                        message: asset.size.to_string(),
+                    });
+                }
+                let clamped_end = match (opt_end, asset.size) {
+                    (Some(e), sz) if sz > 0 => Some(e.min(sz - 1)),
+                    (Some(e), _) => Some(e),
+                    (None, sz) if sz > 0 => Some(sz - 1),
+                    (None, _) => None,
+                };
+                if let Some(e) = clamped_end {
+                    if e < start {
+                        return Err(CommandError {
+                            code: "E_RANGE_UNSATISFIABLE",
+                            message: asset.size.to_string(),
+                        });
+                    }
+                }
+                neb_storage::MediaRangeRequest::FromTo(start, clamped_end)
+            }
+            Some(ByteRangeSpec::Suffix(suffix_len)) => {
+                if suffix_len == 0 {
+                    return Err(CommandError {
+                        code: "E_RANGE_UNSATISFIABLE",
+                        message: asset.size.to_string(),
+                    });
+                }
+                neb_storage::MediaRangeRequest::Suffix(suffix_len)
+            }
+        };
+
+        let upstream = open_remote(req).map_err(|err| {
+            let msg = format!("{err:#}");
+            if let Some(total) = msg.strip_prefix("E_RANGE_UNSATISFIABLE:") {
+                CommandError {
+                    code: "E_RANGE_UNSATISFIABLE",
+                    message: total.trim().to_owned(),
+                }
+            } else {
+                CommandError::from(err)
+            }
+        })?;
+
+        Ok(MediaStream {
+            reader: if head_only {
+                None
+            } else {
+                Some(upstream.reader)
+            },
+            start: upstream.start,
+            end: upstream.end,
+            total_len: upstream.total_len,
+            content_type,
+            partial: upstream.partial,
+        })
+    }
+}
+
+fn resolve_stream_range(
+    range: Option<ByteRangeSpec>,
+    total_len: u64,
+) -> std::result::Result<(u64, u64, bool), CommandError> {
+    match range {
+        Some(ByteRangeSpec::Suffix(suffix_len)) => {
+            if suffix_len == 0 || total_len == 0 {
+                return Err(CommandError {
+                    code: "E_RANGE_UNSATISFIABLE",
+                    message: total_len.to_string(),
+                });
+            }
+            let take = suffix_len.min(total_len);
+            Ok((total_len - take, total_len - 1, true))
+        }
+        Some(ByteRangeSpec::FromTo(start, opt_end)) => {
+            if start >= total_len {
+                return Err(CommandError {
+                    code: "E_RANGE_UNSATISFIABLE",
+                    message: total_len.to_string(),
+                });
+            }
+            let end = opt_end
+                .map(|req| req.min(total_len - 1))
+                .unwrap_or(total_len - 1);
+            if end < start {
+                return Err(CommandError {
+                    code: "E_RANGE_UNSATISFIABLE",
+                    message: total_len.to_string(),
+                });
+            }
+            Ok((start, end, true))
+        }
+        None => Ok((0, total_len - 1, false)),
     }
 }
 

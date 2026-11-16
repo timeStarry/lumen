@@ -287,6 +287,7 @@ export const defaultOrganizeRules = (): OrganizeRules => ({
   subfolder: '',
   rename_mode: 'keep',
   rename_prefix: '',
+  include_videos: true,
 });
 /** Mirrors neb-ingest's subfolder validation so the form can explain problems early. */
 export function subfolderError(value: string): string {

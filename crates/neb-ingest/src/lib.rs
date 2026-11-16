@@ -336,7 +336,7 @@ impl IngestService {
         };
         let source_scope = ScopedSource::open(&source)?;
         let mut warnings = Vec::new();
-        let source_discovery = discover(&source, &mut warnings)?;
+        let source_discovery = discover(&source, rules.include_videos, &mut warnings)?;
         let source_files = source_discovery.files;
         let source_keys: Vec<String> = source_files.iter().map(|f| f.key.clone()).collect();
         let preserve_names = companion_names(&source_keys, &source_discovery.unavailable);
@@ -349,7 +349,7 @@ impl IngestService {
         let sequences = group_sequences(&source_keys);
 
         let (dest_scope, destination_by_size) = if deduplicate && destination.is_dir() {
-            let dest_discovery = discover(&destination, &mut warnings)?;
+            let dest_discovery = discover(&destination, rules.include_videos, &mut warnings)?;
             let mut by_size: HashMap<u64, Vec<String>> = HashMap::new();
             for entry in dest_discovery.files {
                 by_size.entry(entry.size).or_default().push(entry.key);
@@ -843,7 +843,7 @@ impl IngestService {
         };
         let source_scope = ScopedSource::open(&source)?;
         let mut warnings = Vec::new();
-        let discovery = discover(&source, &mut warnings)?;
+        let discovery = discover(&source, rules.include_videos, &mut warnings)?;
         let source_files = discovery.files;
         let source_keys: Vec<String> = source_files.iter().map(|f| f.key.clone()).collect();
         let preserve_names = companion_names(&source_keys, &discovery.unavailable);
@@ -1868,6 +1868,29 @@ fn modified_nanos(metadata: &fs::Metadata) -> Result<u128> {
         .as_nanos())
 }
 
+fn is_video_path(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        extension.as_str(),
+        "mov" | "mp4" | "m4v" | "webm" | "3gp" | "avi" | "mkv" | "mts" | "m2ts"
+    )
+}
+
+fn is_video_key(key: &str) -> bool {
+    is_video_path(Path::new(key))
+}
+
+fn supported_with_options(path: &Path, include_videos: bool) -> bool {
+    if !include_videos && is_video_path(path) {
+        return false;
+    }
+    supported(path)
+}
+
 fn supported(path: &Path) -> bool {
     let extension = path
         .extension()
@@ -1910,10 +1933,15 @@ fn is_reparse_point(metadata: &fs::Metadata) -> bool {
 
 /// Fast single-root metadata discovery without per-file `canonicalize` syscalls.
 /// Rejects symlinks, Windows reparse points, dotfiles, and unsafe filenames.
-fn discover(root: &Path, warnings: &mut Vec<String>) -> Result<DiscoveredFiles> {
+fn discover(
+    root: &Path,
+    include_videos: bool,
+    warnings: &mut Vec<String>,
+) -> Result<DiscoveredFiles> {
     let mut pending = vec![(PathBuf::new(), 0usize)];
     let mut files = Vec::new();
     let mut unavailable = Vec::new();
+    let mut skipped_video_groups: HashSet<String> = HashSet::new();
     while let Some((relative, depth)) = pending.pop() {
         if depth > 64 {
             warnings.push(format!(
@@ -1946,7 +1974,7 @@ fn discover(root: &Path, warnings: &mut Vec<String>) -> Result<DiscoveredFiles> 
             let key = path.to_string_lossy().replace('\\', "/");
             if let Err(error) = validate_key(&name, false) {
                 warnings.push(format!("Skipped {key}: {error}"));
-                if supported(&path) {
+                if supported_with_options(&path, include_videos) {
                     unavailable.push(key);
                 }
                 continue;
@@ -1955,7 +1983,7 @@ fn discover(root: &Path, warnings: &mut Vec<String>) -> Result<DiscoveredFiles> 
                 Ok(metadata) => metadata,
                 Err(error) => {
                     warnings.push(format!("Skipped {key}: {error}"));
-                    if supported(&path) {
+                    if supported_with_options(&path, include_videos) {
                         unavailable.push(key);
                     }
                     continue;
@@ -1965,26 +1993,32 @@ fn discover(root: &Path, warnings: &mut Vec<String>) -> Result<DiscoveredFiles> 
                 warnings.push(format!(
                     "Skipped {key}: Links and reparse points are not followed"
                 ));
-                if supported(&path) {
+                if supported_with_options(&path, include_videos) {
                     unavailable.push(key);
                 }
                 continue;
             }
             if metadata.is_dir() {
                 pending.push((path, depth + 1));
-            } else if metadata.is_file() && supported(&path) {
-                match modified_nanos(&metadata) {
-                    Ok(modified_nanos) => {
-                        files.push(DiscoveredFile {
-                            key,
-                            size: metadata.len(),
-                            modified_nanos,
-                            modified_day: modified_day(&metadata),
-                        });
-                    }
-                    Err(error) => {
-                        warnings.push(format!("Skipped {key}: {error}"));
-                        unavailable.push(key);
+            } else if metadata.is_file() {
+                if !include_videos && is_video_path(&path) {
+                    skipped_video_groups.insert(capture_group(&key));
+                    continue;
+                }
+                if supported(&path) {
+                    match modified_nanos(&metadata) {
+                        Ok(modified_nanos) => {
+                            files.push(DiscoveredFile {
+                                key,
+                                size: metadata.len(),
+                                modified_nanos,
+                                modified_day: modified_day(&metadata),
+                            });
+                        }
+                        Err(error) => {
+                            warnings.push(format!("Skipped {key}: {error}"));
+                            unavailable.push(key);
+                        }
                     }
                 }
             }
@@ -1992,6 +2026,20 @@ fn discover(root: &Path, warnings: &mut Vec<String>) -> Result<DiscoveredFiles> 
                 bail!("Import file limit exceeded");
             }
         }
+    }
+    if !include_videos && !skipped_video_groups.is_empty() {
+        let kept_photo_groups: HashSet<String> = files
+            .iter()
+            .filter(|f| extension_role(&f.key) != "xmp")
+            .map(|f| capture_group(&f.key))
+            .collect();
+        files.retain(|f| {
+            if extension_role(&f.key) != "xmp" {
+                return true;
+            }
+            let grp = capture_group(&f.key);
+            !skipped_video_groups.contains(&grp) || kept_photo_groups.contains(&grp)
+        });
     }
     files.sort_by(|a, b| a.key.cmp(&b.key));
     Ok(DiscoveredFiles { files, unavailable })
@@ -2232,6 +2280,8 @@ fn target_for(
             let folder = organize::kind_folder(anchor);
             if let Some(index) = relative_path.rfind("/RAW/") {
                 relative_path.replace_range(index + 1..index + 4, folder);
+            } else if relative_path.starts_with("RAW/") {
+                relative_path.replace_range(0..3, folder);
             }
         }
     }
@@ -2374,21 +2424,27 @@ fn copy_to_backup(
     bail!("Too many filename conflicts on backup destination")
 }
 
-/// With type folders, each companion group is anchored on its RAW (else first image).
+/// With type folders, each companion group is anchored on its RAW (else first image, else video).
 fn group_anchors(rules: &OrganizeRules, source_files: &[String]) -> HashMap<String, String> {
     let mut by_group: HashMap<String, String> = HashMap::new();
     if rules.type_split != TypeSplit::ByKind {
         return by_group;
     }
     for key in source_files {
-        if extension_role(key) == "xmp" || !is_pairable(key) {
+        if extension_role(key) == "xmp" {
             continue;
         }
-        let entry = by_group
-            .entry(capture_group(key))
-            .or_insert_with(|| key.clone());
-        if organize::kind_folder(key) == "RAW" {
-            *entry = key.clone();
+        if is_pairable(key) {
+            let entry = by_group
+                .entry(capture_group(key))
+                .or_insert_with(|| key.clone());
+            if organize::kind_folder(key) == "RAW" || is_video_key(entry) {
+                *entry = key.clone();
+            }
+        } else if is_video_key(key) {
+            by_group
+                .entry(capture_group(key))
+                .or_insert_with(|| key.clone());
         }
     }
     by_group
@@ -2413,7 +2469,7 @@ fn companion_names(files: &[String], unavailable: &[String]) -> HashSet<String> 
     files
         .iter()
         .chain(unavailable)
-        .filter(|key| is_pairable(key) && sidecars.contains(&capture_group(key)))
+        .filter(|key| (is_pairable(key) || is_video_key(key)) && sidecars.contains(&capture_group(key)))
         .cloned()
         .collect()
 }

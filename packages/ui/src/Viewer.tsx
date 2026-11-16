@@ -250,7 +250,13 @@ export default function Viewer(props: {
       ];
       const seenNeighbours = new Set<string>();
       const neighbours = candidates.filter((each): each is string => {
-        if (!each || each === current.id || FolderBrowser.isPlaceholder(each) || seenNeighbours.has(each))
+        if (
+          !each ||
+          each === current.id ||
+          FolderBrowser.isPlaceholder(each) ||
+          seenNeighbours.has(each) ||
+          items()[each]?.kind === 'video'
+        )
           return false;
         seenNeighbours.add(each);
         return true;
@@ -358,7 +364,7 @@ export default function Viewer(props: {
     return (
       target instanceof HTMLElement &&
       !!target.closest(
-        '.viewer-chrome, .viewer-controls, .compare-bar, .viewer-nav, .asset-inspector',
+        '.viewer-chrome, .viewer-controls, .compare-bar, .viewer-nav, .asset-inspector, .video-stage-fallback',
       )
     );
   }
@@ -971,7 +977,7 @@ export default function Viewer(props: {
     activity();
   }
   function cullKeyboard(event: KeyboardEvent): boolean {
-    if (event.target instanceof HTMLVideoElement) return false;
+    if (event.key === ' ' && event.target instanceof HTMLVideoElement) return true;
     if (event.key === ' ' && (isControl(document.activeElement) || event.repeat)) return false;
     if (event.key === ' ' && asset()?.kind === 'video' && !compareIds().length && toggleVideoPlay) {
       event.preventDefault();
@@ -1650,7 +1656,11 @@ export default function Viewer(props: {
           toolbarTimer = undefined;
           setToolbarAwake(true);
         }
-        if ((event.target as HTMLElement).closest('.photo-stage') && !isControl(event.target))
+        if (
+          (event.target as HTMLElement).closest('.photo-stage') &&
+          !isControl(event.target) &&
+          !(event.target instanceof HTMLVideoElement)
+        )
           container.focus({ preventScroll: true });
       }}
       onFocusIn={(event) => {

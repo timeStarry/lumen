@@ -31,6 +31,7 @@ fn rename_mode_keeps_raw_jpeg_and_xmp_companions_aligned_and_dual_backs_up() {
         subfolder: String::new(),
         rename_mode: RenameMode::DatePrefixSeq,
         rename_prefix: "Editorial".to_string(),
+        include_videos: true,
     };
 
     let mut service = IngestService::open(state.path()).unwrap();

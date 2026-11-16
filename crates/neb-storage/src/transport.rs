@@ -103,6 +103,17 @@ impl LanTarget {
 }
 
 pub(crate) fn client(config: &StorageConfig) -> Result<reqwest::blocking::Client> {
+    client_with_timeout(config, Some(Duration::from_secs(300)))
+}
+
+pub(crate) fn streaming_client(config: &StorageConfig) -> Result<reqwest::blocking::Client> {
+    client_with_timeout(config, None)
+}
+
+fn client_with_timeout(
+    config: &StorageConfig,
+    total_timeout: Option<Duration>,
+) -> Result<reqwest::blocking::Client> {
     let url = validate_endpoint(&config.endpoint)?;
     let pin = normalize_pin(config.tls_certificate_sha256.as_deref())?;
     if pin.is_some() && url.scheme() != "https" {
@@ -113,10 +124,14 @@ pub(crate) fn client(config: &StorageConfig) -> Result<reqwest::blocking::Client
     } else {
         None
     };
-    build_client(pin, lan.as_ref())
+    build_client(pin, lan.as_ref(), total_timeout)
 }
 
-fn build_client(pin: Option<String>, lan: Option<&LanTarget>) -> Result<reqwest::blocking::Client> {
+fn build_client(
+    pin: Option<String>,
+    lan: Option<&LanTarget>,
+    total_timeout: Option<Duration>,
+) -> Result<reqwest::blocking::Client> {
     if pin.is_some() && lan.is_none() {
         bail!("Certificate fingerprint trust requires approved LAN addresses");
     }
@@ -124,7 +139,7 @@ fn build_client(pin: Option<String>, lan: Option<&LanTarget>) -> Result<reqwest:
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(Duration::from_secs(300));
+        .timeout(total_timeout);
     if let Some(lan) = lan {
         // This is the same immutable answer set that passed LAN policy, not a second DNS query.
         builder = builder.resolve_to_addrs(&lan.host, &lan.addresses);
@@ -401,7 +416,7 @@ mod tests {
                 .unwrap();
         });
         let target = LanTarget::checked("never-resolves.invalid".into(), vec![address]).unwrap();
-        let client = build_client(None, Some(&target)).unwrap();
+        let client = build_client(None, Some(&target), Some(Duration::from_secs(10))).unwrap();
         assert_eq!(
             client
                 .get(format!("http://never-resolves.invalid:{}/", address.port()))

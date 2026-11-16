@@ -60,13 +60,19 @@ export default function ViewerOverlay(props: {
   const usesHistogram = createMemo(() =>
     CORNERS.some((corner) => layout()[corner].some((id) => widgetById(id)?.needsHistogram)),
   );
-  // Only fetched while a histogram widget is shown; the service answers from its cache.
+  // Only fetched while a histogram widget is shown on a still photo; videos have no static pixel histogram.
   const [histogram] = createResource(
-    () => (props.visible && usesHistogram() ? imageRequestKey(props.asset) : undefined),
+    () =>
+      props.visible && usesHistogram() && props.asset.kind !== 'video'
+        ? imageRequestKey(props.asset)
+        : undefined,
     (key) =>
       execute<Histogram>('asset.histogram', { id: JSON.parse(key).id }).catch(() => undefined),
   );
-  const context = (): WidgetContext => ({ ...props.context, histogram: histogram() });
+  const context = (): WidgetContext => ({
+    ...props.context,
+    histogram: props.asset.kind === 'video' ? undefined : histogram(),
+  });
   const content = (id: string): JSX.Element | null => {
     const widget = widgetById(id);
     return widget ? widget.render(props.asset, context()) : null;

@@ -41,6 +41,14 @@
 .immersive-viewer:has(.viewer-controls) .nl-overlay-corner--br {
   bottom: 64px;
 }
+.immersive-viewer:has(.video-stage) .nl-overlay:not(.nl-overlay--editing) .nl-overlay-corner--tl,
+.immersive-viewer:has(.video-stage) .nl-overlay:not(.nl-overlay--editing) .nl-overlay-corner--tr {
+  top: 56px;
+}
+.immersive-viewer:has(.video-stage) .nl-overlay:not(.nl-overlay--editing) .nl-overlay-corner--bl,
+.immersive-viewer:has(.video-stage) .nl-overlay:not(.nl-overlay--editing) .nl-overlay-corner--br {
+  bottom: 68px;
+}
 .immersive-viewer.culling .nl-overlay {
   bottom: var(--cull-strip-height, 0px);
 }

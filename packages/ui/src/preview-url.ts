@@ -1,4 +1,4 @@
-import { convertFileSrc, isTauri } from '@tauri-apps/api/core';
+import { convertFileSrc, invoke, isTauri } from '@tauri-apps/api/core';
 import { demoMediaUrl, demoPreviewUrl } from './demo';
 import { TIER_PIXELS, type Asset, type PreviewTier } from './model';
 
@@ -32,14 +32,34 @@ export function previewUrl(
     'neb',
   );
 }
+let cachedMediaBase: Promise<string | null> | undefined;
+
+function resolveDesktopMediaBase(): Promise<string | null> {
+  if (!cachedMediaBase) {
+    cachedMediaBase = invoke<string | null>('media_stream_base').catch(() => null);
+  }
+  return cachedMediaBase;
+}
+
+/** Reset cached loopback media server base (for unit tests). */
+export function resetMediaBaseCache(): void {
+  cachedMediaBase = undefined;
+}
+
 /**
- * Desktop: byte-range media stream (`206 Partial Content`) served by `neb://localhost/media/<id>/<rev>`.
+ * Desktop: capability-protected loopback HTTP byte-range stream (`http://127.0.0.1:<port>/media/<token>/<id>/<rev>`)
+ * so macOS `AVPlayer` and Windows `WebView2` seek trailing `moov` atoms and stream in 64 KiB chunks natively,
+ * falling back to `neb://localhost/media/<id>/<rev>` if the loopback server is unavailable.
  * Browser demo: object URL for the local File blob.
  */
 export function mediaUrl(asset: Pick<Asset, 'id' | 'preview_revision'>): string | Promise<string> {
   const revision = asset.preview_revision || 0;
   if (!isTauri()) return demoMediaUrl(asset.id);
-  return convertFileSrc(`media/${asset.id}/${revision}`, 'neb');
+  return resolveDesktopMediaBase().then((base) =>
+    base
+      ? `${base}/${encodeURIComponent(asset.id)}/${revision}`
+      : convertFileSrc(`media/${asset.id}/${revision}`, 'neb'),
+  );
 }
 /**
  * Fetches and decodes an image into the element that will be displayed, so each image costs

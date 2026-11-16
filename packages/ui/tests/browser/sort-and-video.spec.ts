@@ -89,9 +89,18 @@ test('default library sort preference and video format filtering & stage', async
   await filterGroup.getByRole('button', { name: '清除全部' }).click();
   await expect(tiles).toHaveCount(3);
 
-  // 3. Double-click the video tile to open the inline video stage in Viewer overlay, and mark it (`P`).
+  // 3. Double-click the video tile to open the inline video stage in Viewer overlay, verify clearance & no histogram, and mark it (`P`).
   await page.getByRole('button', { name: /clip-mid\.mp4/ }).dblclick();
   await expect(page.locator('.viewer-overlay .video-stage')).toBeVisible();
+  await expect(page.locator('.viewer-overlay .nl-widget-hist')).toHaveCount(0);
+
+  const barBox = await page.locator('.viewer-overlay .nl-viewer-bar').boundingBox();
+  const stagePaddingTop = await page
+    .locator('.viewer-overlay .video-stage')
+    .evaluate((el) => parseFloat(getComputedStyle(el).paddingTop));
+  expect(barBox).not.toBeNull();
+  expect(stagePaddingTop).toBeGreaterThanOrEqual(barBox!.height);
+
   await page.keyboard.press('p');
   await page.keyboard.press('Escape');
   await expect(page.getByRole('button', { name: /clip-mid\.mp4.*留用/ })).toBeVisible();

@@ -1,8 +1,8 @@
 import { Show, createEffect, createMemo, createSignal, on, onCleanup } from 'solid-js';
-import { desktop, execute } from './api';
+import { desktop } from './api';
 import Icon from './Icon';
-import type { Asset, Preview } from './model';
-import { decodedThumbnail, rememberDecodedPreview } from './PhotoView';
+import { formatDurationSeconds, type Asset } from './model';
+import { decodedThumbnail } from './PhotoView';
 import { mediaUrl, previewUrl } from './preview-url';
 import { Button } from './ui';
 import './VideoStage.css';
@@ -30,26 +30,14 @@ export default function VideoStage(props: {
       const current = props.asset;
       setFailed(false);
       setSrc('');
-      setPoster(decodedThumbnail(current) || '');
-
-      void Promise.resolve(previewUrl(current, 'p2560'))
-        .then((resolvedPoster) => {
-          if (cancelled) return;
-          setPoster(resolvedPoster);
-          rememberDecodedPreview(current, resolvedPoster, current.width, current.height);
-        })
-        .catch(() => undefined);
-
-      if (!current.width || !current.metadata?.Duration) {
-        void execute<Preview>(
-          'asset.preview',
-          { id: current.id, tier: 'p2560', uncropped: true },
-          { source: current.source_key ? 'remote' : 'local', priority: 'viewer' },
-        )
-          .then((preview) => {
-            if (!cancelled && preview.asset?.id === current.id) {
-              props.onInspected?.(preview.asset);
-            }
+      const memThumb = decodedThumbnail(current);
+      if (memThumb) {
+        setPoster(memThumb);
+      } else {
+        setPoster('');
+        void Promise.resolve(previewUrl(current, 't512'))
+          .then((resolvedPoster) => {
+            if (!cancelled) setPoster(resolvedPoster);
           })
           .catch(() => undefined);
       }
@@ -67,6 +55,25 @@ export default function VideoStage(props: {
       });
     }),
   );
+
+  function handleLoadedMetadata() {
+    if (!videoEl) return;
+    const current = props.asset;
+    const vw = videoEl.videoWidth || current.width;
+    const vh = videoEl.videoHeight || current.height;
+    const dur =
+      !current.metadata?.Duration && Number.isFinite(videoEl.duration) && videoEl.duration > 0
+        ? formatDurationSeconds(videoEl.duration)
+        : current.metadata?.Duration;
+    if (vw !== current.width || vh !== current.height || dur !== current.metadata?.Duration) {
+      props.onInspected?.({
+        ...current,
+        width: vw,
+        height: vh,
+        metadata: dur ? { ...current.metadata, Duration: dur } : current.metadata,
+      });
+    }
+  }
 
   function togglePlay() {
     if (!videoEl || failed()) return;
@@ -95,7 +102,7 @@ export default function VideoStage(props: {
   });
 
   return (
-    <div class="photo-view">
+    <div class="viewer video-viewer">
       <div class="photo-stage video-stage">
         <Show
           when={!failed()}
@@ -136,8 +143,9 @@ export default function VideoStage(props: {
                 poster={poster() || undefined}
                 controls
                 playsinline
-                preload="metadata"
+                preload="auto"
                 aria-label={props.asset.filename}
+                onLoadedMetadata={handleLoadedMetadata}
                 onError={() => setFailed(true)}
               />
             )}

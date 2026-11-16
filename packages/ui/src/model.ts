@@ -353,6 +353,7 @@ export interface OrganizeRules {
   subfolder: string;
   rename_mode?: RenameMode;
   rename_prefix?: string;
+  include_videos?: boolean;
 }
 export interface ImportPlan {
   id: string;

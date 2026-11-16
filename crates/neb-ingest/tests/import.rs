@@ -731,3 +731,82 @@ fn large_batch_planning_skips_full_hashing_for_unique_sizes_and_seeks_video_date
         .unwrap();
     assert_eq!(copied_clip.sha256.as_deref(), Some(expected_mp4_sha.as_str()));
 }
+
+#[test]
+fn video_type_split_and_include_videos_filter_behave_cleanly() {
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let history = tempfile::tempdir().unwrap();
+    fs::create_dir_all(source.path().join("DCIM/100NIKON")).unwrap();
+    fs::create_dir_all(source.path().join("PRIVATE/M4ROOT/CLIP")).unwrap();
+
+    fs::write(source.path().join("DCIM/100NIKON/DSC_0001.NEF"), b"raw").unwrap();
+    fs::write(source.path().join("DCIM/100NIKON/DSC_0001.xmp"), b"<x/>").unwrap();
+    fs::write(
+        source.path().join("PRIVATE/M4ROOT/CLIP/C0001.MP4"),
+        b"video-mp4",
+    )
+    .unwrap();
+    fs::write(
+        source.path().join("PRIVATE/M4ROOT/CLIP/C0001.xmp"),
+        b"<v/>",
+    )
+    .unwrap();
+
+    let mut service = IngestService::open(history.path()).unwrap();
+
+    // 1. With `type_split: by_kind` and `include_videos: true` (default), video + its .xmp go to `VIDEO/`.
+    let rules_with_video: neb_ingest::OrganizeRules = serde_json::from_value(serde_json::json!({
+        "date_basis": "import",
+        "type_split": "by_kind"
+    }))
+    .unwrap();
+    let plan_all = service
+        .plan_with_options(
+            source.path(),
+            destination.path(),
+            &rules_with_video,
+            true,
+            None,
+        )
+        .unwrap();
+    assert_eq!(plan_all.items.len(), 4);
+    assert!(plan_all
+        .items
+        .iter()
+        .any(|i| i.relative_path.ends_with("/VIDEO/C0001.MP4")));
+    assert!(plan_all
+        .items
+        .iter()
+        .any(|i| i.relative_path.ends_with("/VIDEO/C0001.xmp")));
+    assert!(plan_all
+        .items
+        .iter()
+        .any(|i| i.relative_path.ends_with("/RAW/DSC_0001.NEF")));
+    assert!(plan_all
+        .items
+        .iter()
+        .any(|i| i.relative_path.ends_with("/RAW/DSC_0001.xmp")));
+
+    // 2. With `include_videos: false`, both the video and its video-only `.xmp` are skipped, while photo + photo `.xmp` remain.
+    let rules_photos_only: neb_ingest::OrganizeRules = serde_json::from_value(serde_json::json!({
+        "date_basis": "import",
+        "type_split": "by_kind",
+        "include_videos": false
+    }))
+    .unwrap();
+    let plan_photos = service
+        .plan_with_options(
+            source.path(),
+            destination.path(),
+            &rules_photos_only,
+            true,
+            None,
+        )
+        .unwrap();
+    assert_eq!(plan_photos.items.len(), 2);
+    assert!(plan_photos
+        .items
+        .iter()
+        .all(|i| i.source_relative_path.starts_with("DCIM/100NIKON/DSC_0001.")));
+}

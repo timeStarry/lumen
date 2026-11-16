@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod drop;
 mod file_open;
+mod media_server;
 mod pregenerate;
 mod preview_protocol;
 mod shell;
@@ -36,6 +37,11 @@ async fn execute(
         })?
 }
 
+#[tauri::command]
+fn media_stream_base(server: State<'_, Option<media_server::MediaServer>>) -> Option<String> {
+    server.inner().as_ref().map(|s| s.base_url().to_owned())
+}
+
 fn main() {
     let startup_paths = file_open::startup_paths(std::env::args_os().skip(1));
     let open_from_command_line = !startup_paths.is_empty();
@@ -56,7 +62,10 @@ fn main() {
             let data_dir = std::env::var_os("NEBULUME_DATA_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or(app.path().app_local_data_dir()?);
-            app.manage(Arc::new(Service::open(data_dir)?));
+            let service = Arc::new(Service::open(data_dir)?);
+            let media_server = media_server::MediaServer::start(Arc::clone(&service)).ok();
+            app.manage(media_server);
+            app.manage(service);
             if !open_from_command_line {
                 viewer::show_manager_window(app.handle())
                     .map_err(|error| std::io::Error::other(error.message))?;
@@ -65,6 +74,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             execute,
+            media_stream_base,
             viewer::open_viewer,
             viewer::viewer_context,
             viewer::show_manager,
