@@ -1,13 +1,14 @@
 //! Independent browse snapshot. It never holds a StorageRegistry lock while
 //! resolving a remote endpoint, issuing HTTP, or enumerating a local directory.
 use crate::{
-    remote, safe, safe_join, transport, validate_key, Availability, AvailabilityCell, BrowsePage,
-    Credentials, StorageCheck, StorageConfig, StorageEntry,
+    remote, safe, safe_join, transport, validate_key, validate_xmp_key, Availability,
+    AvailabilityCell, BrowsePage, Credentials, StorageCheck, StorageConfig, StorageEntry,
 };
-use anyhow::Result;
+use anyhow::{bail, Result};
 use reqwest::blocking::Client;
 use std::{
     fs,
+    io::Read,
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -42,6 +43,53 @@ impl StorageBrowser {
         result
     }
 
+    /// Reads an `.xmp` sidecar up to `max_bytes` without holding any registry lock.
+    /// Returns `Ok(None)` when no sidecar exists at `key`.
+    pub fn read_sidecar(&self, key: &str, max_bytes: u64) -> Result<Option<Vec<u8>>> {
+        validate_xmp_key(key)?;
+        let result = if self.config.kind != "local" {
+            let client = self.http_client()?;
+            remote::read_sidecar_bytes(&client, &self.config, &self.credentials, key, max_bytes)
+                .map(|opt| opt.map(|(bytes, _)| bytes))
+        } else {
+            let root = safe_join(Path::new(&self.config.endpoint), &self.config.root, true)?;
+            let target = safe_join(&root, key, false)?;
+            match fs::symlink_metadata(&target) {
+                Ok(meta) if meta.file_type().is_file() => {
+                    if meta.len() > max_bytes {
+                        bail!("E_LIMIT: Sidecar exceeds size limit");
+                    }
+                    let mut bytes = Vec::new();
+                    fs::File::open(&target)?
+                        .take(max_bytes + 1)
+                        .read_to_end(&mut bytes)?;
+                    if bytes.len() as u64 > max_bytes {
+                        bail!("E_LIMIT: Sidecar exceeds size limit");
+                    }
+                    Ok(Some(bytes))
+                }
+                Ok(_) => Ok(None),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(err) => Err(err.into()),
+            }
+        };
+        if self.config.kind != "local" {
+            self.connected.set(Availability::of(&result));
+        }
+        result
+    }
+
+    fn http_client(&self) -> Result<Client> {
+        let mut slot = self
+            .client
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Storage snapshot connection is unavailable"))?;
+        if slot.is_none() {
+            *slot = Some(transport::client(&self.config)?);
+        }
+        Ok(slot.as_ref().expect("client initialized above").clone())
+    }
+
     /// Performs the same authenticated one-entry probe as registry.check,
     /// while all network work remains outside the registry lock.
     pub fn check(&self) -> Result<StorageCheck> {
@@ -60,16 +108,7 @@ impl StorageBrowser {
         validate_key(prefix, true)?;
         let limit = limit.clamp(1, 1000);
         if self.config.kind != "local" {
-            let client = {
-                let mut slot = self
-                    .client
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("Storage snapshot connection is unavailable"))?;
-                if slot.is_none() {
-                    *slot = Some(transport::client(&self.config)?);
-                }
-                slot.as_ref().expect("client initialized above").clone()
-            };
+            let client = self.http_client()?;
             return remote::browse(
                 &client,
                 &self.config,

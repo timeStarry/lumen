@@ -166,87 +166,93 @@ impl Core {
             "errors": failed,
         }))
     }
+}
 
-    pub(super) fn read_xmp_sidecars(&self, args: XmpTargetArgs) -> Result<Value> {
-        struct PendingXmpUpdate {
-            id: String,
-            library_id: String,
-            rating: u8,
-            flag: String,
-            color_label: String,
-            crop: Option<Crop>,
-            keywords: Option<Vec<String>>,
-            crop_changed: bool,
+#[derive(Debug, Clone)]
+pub struct PendingXmpUpdate {
+    pub id: String,
+    pub library_id: String,
+    pub rating: u8,
+    pub flag: String,
+    pub color_label: String,
+    pub crop: Option<Crop>,
+    pub keywords: Option<Vec<String>>,
+    pub crop_changed: bool,
+}
+
+pub fn compute_xmp_update(asset: &Asset, sidecar: xmp::SidecarData) -> Option<PendingXmpUpdate> {
+    let next_rating = sidecar.rating.unwrap_or(asset.rating);
+    let next_flag = sidecar.flag.unwrap_or_else(|| asset.flag.clone());
+    let next_label = sidecar
+        .color_label
+        .unwrap_or_else(|| asset.color_label.clone());
+    let next_crop = match sidecar.crop {
+        Some(crop_opt) => crop_opt,
+        None => asset.crop,
+    };
+    let mut next_keywords = sidecar.keywords;
+    next_keywords.sort();
+    let mut current_keywords = asset.keywords.clone();
+    current_keywords.sort();
+    let kw_changed = !next_keywords.is_empty() && next_keywords != current_keywords;
+    let crop_changed = next_crop != asset.crop;
+    if next_rating != asset.rating
+        || next_flag != asset.flag
+        || next_label != asset.color_label
+        || crop_changed
+        || kw_changed
+    {
+        Some(PendingXmpUpdate {
+            id: asset.id.clone(),
+            library_id: asset.library_id.clone(),
+            rating: next_rating,
+            flag: next_flag,
+            color_label: next_label,
+            crop: next_crop,
+            keywords: kw_changed.then_some(next_keywords),
+            crop_changed,
+        })
+    } else {
+        None
+    }
+}
+
+impl Core {
+    pub fn apply_initial_remote_sidecar(
+        &self,
+        asset_id: &str,
+        library_id: &str,
+        sidecar: xmp::SidecarData,
+    ) -> Result<()> {
+        let crop_json = sidecar
+            .crop
+            .and_then(|c| c)
+            .map(|c| serde_json::to_string(&c))
+            .transpose()?;
+        if sidecar.rating.is_some()
+            || sidecar.flag.is_some()
+            || sidecar.color_label.is_some()
+            || crop_json.is_some()
+        {
+            self.db()?.execute(
+                "UPDATE assets SET rating=COALESCE(?1,rating),flag=COALESCE(?2,flag),color_label=COALESCE(?3,color_label),crop_json=COALESCE(?4,crop_json) WHERE id=?5",
+                params![sidecar.rating, sidecar.flag, sidecar.color_label, crop_json, asset_id],
+            )?;
         }
+        if !sidecar.keywords.is_empty() {
+            let mut db = self.db()?;
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            collections::replace_asset_keywords_tx(&tx, library_id, asset_id, &sidecar.keywords)?;
+            tx.commit()?;
+        }
+        Ok(())
+    }
 
-        let assets = self.resolve_xmp_targets(args)?;
+    pub fn apply_xmp_updates(
+        &self,
+        pending_updates: Vec<PendingXmpUpdate>,
+    ) -> Result<(usize, Vec<String>)> {
         let mut updated = 0usize;
-        let mut skipped = 0usize;
-        let mut failed = Vec::new();
-        let mut pending_updates: Vec<PendingXmpUpdate> = Vec::new();
-
-        for asset in assets {
-            if asset.source_key.is_some() {
-                skipped += 1;
-                continue;
-            }
-            let path = match self.checked_asset_path(&asset) {
-                Ok(path) => path,
-                Err(error) => {
-                    failed.push(json!({
-                        "id": asset.id,
-                        "path": asset.path,
-                        "message": format!("{error:#}"),
-                    }));
-                    continue;
-                }
-            };
-            match xmp::read_sidecar_for_image(&path) {
-                Ok(Some(sidecar)) => {
-                    let next_rating = sidecar.rating.unwrap_or(asset.rating);
-                    let next_flag = sidecar.flag.unwrap_or_else(|| asset.flag.clone());
-                    let next_label = sidecar
-                        .color_label
-                        .unwrap_or_else(|| asset.color_label.clone());
-                    let next_crop = match sidecar.crop {
-                        Some(crop_opt) => crop_opt,
-                        None => asset.crop,
-                    };
-                    let mut next_keywords = sidecar.keywords;
-                    next_keywords.sort();
-                    let mut current_keywords = asset.keywords.clone();
-                    current_keywords.sort();
-                    let kw_changed = !next_keywords.is_empty() && next_keywords != current_keywords;
-                    let crop_changed = next_crop != asset.crop;
-                    if next_rating != asset.rating
-                        || next_flag != asset.flag
-                        || next_label != asset.color_label
-                        || crop_changed
-                        || kw_changed
-                    {
-                        pending_updates.push(PendingXmpUpdate {
-                            id: asset.id,
-                            library_id: asset.library_id,
-                            rating: next_rating,
-                            flag: next_flag,
-                            color_label: next_label,
-                            crop: next_crop,
-                            keywords: kw_changed.then_some(next_keywords),
-                            crop_changed,
-                        });
-                    } else {
-                        skipped += 1;
-                    }
-                }
-                Ok(None) => skipped += 1,
-                Err(error) => failed.push(json!({
-                    "id": asset.id,
-                    "path": asset.path,
-                    "message": format!("{error:#}"),
-                })),
-            }
-        }
-
         if !pending_updates.is_empty() {
             let mut db = self.db()?;
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -283,11 +289,82 @@ impl Core {
                 }
             }
         }
-
-        let crop_changed_ids: Vec<String> = pending_updates
+        let crop_changed_ids = pending_updates
             .into_iter()
             .filter_map(|item| item.crop_changed.then_some(item.id))
             .collect();
+        Ok((updated, crop_changed_ids))
+    }
+
+    pub fn resolve_xmp_assets(
+        &self,
+        ids: Option<&[String]>,
+        library_id: Option<&str>,
+    ) -> Result<Vec<Asset>> {
+        if let Some(ids) = ids {
+            ensure!(
+                (1..=5000).contains(&ids.len()),
+                "E_INVALID: XMP batch must name 1 to 5000 assets"
+            );
+            let expanded = self.with_pair_members(ids)?;
+            let mut out = Vec::with_capacity(expanded.len());
+            for id in expanded {
+                out.push(self.asset(&id)?);
+            }
+            return Ok(out);
+        }
+        if let Some(library_id) = library_id {
+            self.library(library_id)?;
+            let ids = self.all_asset_ids(library_id)?;
+            let mut out = Vec::with_capacity(ids.len());
+            for id in ids {
+                out.push(self.asset(&id)?);
+            }
+            return Ok(out);
+        }
+        bail!("E_INVALID: Provide ids or library_id for XMP operation")
+    }
+
+    pub(super) fn read_xmp_sidecars(&self, args: XmpTargetArgs) -> Result<Value> {
+        let assets = self.resolve_xmp_targets(args)?;
+        let mut skipped = 0usize;
+        let mut failed = Vec::new();
+        let mut pending_updates: Vec<PendingXmpUpdate> = Vec::new();
+
+        for asset in assets {
+            if asset.source_key.is_some() {
+                skipped += 1;
+                continue;
+            }
+            let path = match self.checked_asset_path(&asset) {
+                Ok(path) => path,
+                Err(error) => {
+                    failed.push(json!({
+                        "id": asset.id,
+                        "path": asset.path,
+                        "message": format!("{error:#}"),
+                    }));
+                    continue;
+                }
+            };
+            match xmp::read_sidecar_for_image(&path) {
+                Ok(Some(sidecar)) => {
+                    if let Some(update) = compute_xmp_update(&asset, sidecar) {
+                        pending_updates.push(update);
+                    } else {
+                        skipped += 1;
+                    }
+                }
+                Ok(None) => skipped += 1,
+                Err(error) => failed.push(json!({
+                    "id": asset.id,
+                    "path": asset.path,
+                    "message": format!("{error:#}"),
+                })),
+            }
+        }
+
+        let (updated, crop_changed_ids) = self.apply_xmp_updates(pending_updates)?;
 
         Ok(json!({
             "updated": updated,
@@ -298,27 +375,6 @@ impl Core {
     }
 
     fn resolve_xmp_targets(&self, args: XmpTargetArgs) -> Result<Vec<Asset>> {
-        if let Some(ids) = args.ids {
-            ensure!(
-                (1..=5000).contains(&ids.len()),
-                "E_INVALID: XMP batch must name 1 to 5000 assets"
-            );
-            let expanded = self.with_pair_members(&ids)?;
-            let mut out = Vec::with_capacity(expanded.len());
-            for id in expanded {
-                out.push(self.asset(&id)?);
-            }
-            return Ok(out);
-        }
-        if let Some(library_id) = args.library_id {
-            self.library(&library_id)?;
-            let ids = self.local_asset_ids(&library_id)?;
-            let mut out = Vec::with_capacity(ids.len());
-            for id in ids {
-                out.push(self.asset(&id)?);
-            }
-            return Ok(out);
-        }
-        bail!("E_INVALID: Provide ids or library_id for XMP operation")
+        self.resolve_xmp_assets(args.ids.as_deref(), args.library_id.as_deref())
     }
 }

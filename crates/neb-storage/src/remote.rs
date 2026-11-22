@@ -114,6 +114,52 @@ pub(crate) fn read_response(
     checked(response)
 }
 
+pub(crate) fn read_sidecar_bytes(
+    client: &Client,
+    config: &StorageConfig,
+    credentials: &Credentials,
+    key: &str,
+    max_bytes: u64,
+) -> Result<Option<(Vec<u8>, Option<String>)>> {
+    use reqwest::{
+        header::{CONTENT_LENGTH, ETAG},
+        StatusCode,
+    };
+    let url = url_for(config, key)?;
+    let response = if config.kind == "s3" {
+        s3_request(client, credentials, config, url, &[])?.send()?
+    } else {
+        dav_request(client, credentials, Method::GET, url).send()?
+    };
+    if response.status() == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let response = checked(response)?;
+    if let Some(len) = response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        if len > max_bytes {
+            bail!("E_LIMIT: Remote XMP sidecar exceeds size limit");
+        }
+    }
+    let etag = response
+        .headers()
+        .get(ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let mut bytes = Vec::new();
+    response.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        bail!("E_LIMIT: Remote XMP sidecar exceeds size limit");
+    }
+    Ok(Some((bytes, etag)))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaSlice {
     pub bytes: Vec<u8>,

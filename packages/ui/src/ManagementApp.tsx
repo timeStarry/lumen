@@ -2408,24 +2408,20 @@ export default function ManagementApp() {
             },
           ] as MenuEntry[])
         : []),
-      ...(!library.source_kind || library.source_kind === 'local'
-        ? ([
-            {
-              label: '导出整库 .xmp 伴随文件',
-              icon: 'file',
-              disabled: scanningThis || blocked || !!busy(),
-              title: reason,
-              onSelect: () => void syncXmp('write', { libraryId: library.id, label: library.name }),
-            },
-            {
-              label: '从 .xmp 同步外部修改',
-              icon: 'refresh',
-              disabled: scanningThis || blocked || !!busy(),
-              title: reason,
-              onSelect: () => void syncXmp('read', { libraryId: library.id, label: library.name }),
-            },
-          ] as MenuEntry[])
-        : []),
+      {
+        label: '导出整库 .xmp 伴随文件',
+        icon: 'file',
+        disabled: scanningThis || blocked || !!busy(),
+        title: reason,
+        onSelect: () => void syncXmp('write', { libraryId: library.id, label: library.name }),
+      },
+      {
+        label: '从 .xmp 同步外部修改',
+        icon: 'refresh',
+        disabled: scanningThis || blocked || !!busy(),
+        title: reason,
+        onSelect: () => void syncXmp('read', { libraryId: library.id, label: library.name }),
+      },
       'separator',
       {
         label: '移除图片库…',

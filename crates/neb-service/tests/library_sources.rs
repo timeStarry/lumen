@@ -147,6 +147,10 @@ fn webdav_library_roundtrip(
         // the path guard. Recovery must reuse that cache without another GET.
         fs::write(asset["path"].as_str().unwrap(), PHOTO).unwrap();
     }
+    // This test uses a minimal 2/3-step mock server for original image reads; disable
+    // automatic background XMP requests before mutating catalog marks.
+    svc.execute("xmp.policy.set", json!({"auto_write":false}))
+        .unwrap();
     // Edit the already indexed placeholder, then reopen the catalog before the
     // first GET. The fix must work with existing indexes without rebuilding them.
     svc.execute("asset.rate", json!({"id":asset["id"],"rating":3}))

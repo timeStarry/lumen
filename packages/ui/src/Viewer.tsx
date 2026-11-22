@@ -569,7 +569,7 @@ export default function Viewer(props: {
               },
             ]
           : []),
-        ...(local
+        ...(target
           ? [
               {
                 label: '写入 .xmp 伴随文件',
@@ -1639,7 +1639,7 @@ export default function Viewer(props: {
   }
   async function syncViewerXmp(mode: 'write' | 'read') {
     const target = asset();
-    if (!target || target.source_key) return;
+    if (!target) return;
     await action(mode === 'write' ? '正在写入 .xmp 伴随文件…' : '正在读取 .xmp 伴随文件…', async () => {
       const report = await execute<XmpSyncReport>(
         mode === 'write' ? 'asset.xmp.write' : 'asset.xmp.read',
@@ -1649,7 +1649,7 @@ export default function Viewer(props: {
         const refreshed = await execute<Asset>('asset.get', { id: target.id });
         await changed({ ...refreshed, preview_revision: Date.now() }, 'crop');
         setNotice(report.updated ? '已从 .xmp 同步标记与裁剪。' : '未检测到新的 .xmp 伴随变更。');
-      } else {
+      } else if (!report.errors.length) {
         setNotice(`已写入 .xmp 伴随文件。`);
       }
       if (report.errors.length) setError(report.errors[0].message);

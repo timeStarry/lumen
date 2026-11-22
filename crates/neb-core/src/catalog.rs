@@ -24,6 +24,8 @@ mod query;
 mod scan;
 mod xmp_sync;
 
+pub use xmp_sync::{compute_xmp_update, PendingXmpUpdate};
+
 use query::ListMemo;
 
 pub struct Core {
@@ -1669,6 +1671,17 @@ impl Core {
         cache_filename: &str,
         size: u64,
     ) -> Result<Asset> {
+        self.register_remote_asset_status(library_id, source_key, cache_filename, size)
+            .map(|(asset, _)| asset)
+    }
+
+    pub fn register_remote_asset_status(
+        &self,
+        library_id: &str,
+        source_key: &str,
+        cache_filename: &str,
+        size: u64,
+    ) -> Result<(Asset, bool)> {
         ensure!(
             size <= i64::MAX as u64,
             "E_LIMIT: Image size exceeds catalog range"
@@ -1711,9 +1724,10 @@ impl Core {
             .optional()?;
         if let Some(old) = &old {
             if (size == 0 || old.size == size) && old.availability != "missing" {
-                return Ok(old.clone());
+                return Ok((old.clone(), false));
             }
         }
+        let is_new = old.is_none();
         let id = old
             .map(|asset| asset.id)
             .unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -1722,7 +1736,7 @@ impl Core {
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'',?10,'remote',?9,?9)
              ON CONFLICT(id) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,filename=excluded.filename,size=excluded.size,modified_stamp=excluded.modified_stamp,width=NULL,height=NULL,metadata_json='{}',captured_at='',captured_at_checked=0,availability='remote',sha256=NULL",
              params![id,library_id,path,path_key(&path),filename,extension,kind,size,source_key,format!("remote:{}",Uuid::new_v4())])?;
-        self.asset(&id)
+        Ok((self.asset(&id)?, is_new))
     }
 
     /// Record the source's creation time, never the downloaded cache file's birth time.
@@ -2142,6 +2156,22 @@ impl Core {
             .query_map([library_id], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(ids)
+    }
+
+    /// All non-trashed, non-missing asset IDs in a library (local or remote).
+    pub fn all_asset_ids(&self, library_id: &str) -> Result<Vec<String>> {
+        let db = self.db()?;
+        let mut statement = db.prepare(
+            "SELECT id FROM assets WHERE library_id=?1 AND trashed_at IS NULL AND availability!='missing' ORDER BY captured_at DESC,id",
+        )?;
+        let ids = statement
+            .query_map([library_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids)
+    }
+
+    pub fn expand_pair_members(&self, ids: &[String]) -> Result<Vec<String>> {
+        self.with_pair_members(ids)
     }
     pub fn library_summaries(&self) -> Result<HashMap<String, Value>> {
         let db = self.db()?;

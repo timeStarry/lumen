@@ -26,7 +26,7 @@ pub mod video;
 pub mod xmp;
 
 pub use cache::{CacheLease, CacheManager, Reservation};
-pub use catalog::Core;
+pub use catalog::{compute_xmp_update, Core, PendingXmpUpdate};
 pub use focus_points::read_from as remote_focus;
 pub use focus_points::{FocusInfo, FocusRegion};
 pub use imaging::{

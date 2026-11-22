@@ -98,6 +98,7 @@ fn handle(
     let path = key(&path);
     methods.lock().unwrap().push((method.clone(), path.clone()));
     let mut files = store.lock().unwrap();
+    let mut response_etag: Option<String> = None;
     let (status, reply): (&str, Vec<u8>) = match method.as_str() {
         "HEAD" => (
             if files.contains_key(&path) {
@@ -109,7 +110,10 @@ fn handle(
         ),
         "GET" => match files.get(&path) {
             _ if mode == Mode::ForbidGet => ("500 Internal Server Error", vec![]),
-            Some(bytes) => ("200 OK", bytes.clone()),
+            Some(bytes) => {
+                response_etag = Some(format!("\"{}\"", hex_sha(bytes)));
+                ("200 OK", bytes.clone())
+            }
             None => ("404 Not Found", vec![]),
         },
         "DELETE" => {
@@ -119,7 +123,8 @@ fn handle(
         "MKCOL" => ("201 Created", vec![]),
         "PUT" => {
             let conditional = headers.get("if-none-match").map(String::as_str) == Some("*");
-            if kind == "s3" && mode == Mode::NoConditional && conditional {
+            let if_match = headers.get("if-match").cloned();
+            if kind == "s3" && mode == Mode::NoConditional && (conditional || if_match.is_some()) {
                 (
                     "501 Not Implemented",
                     b"<Error><Code>NotImplemented</Code></Error>".to_vec(),
@@ -131,6 +136,16 @@ fn handle(
                 )
             } else if conditional && mode != Mode::Overwrites && files.contains_key(&path) {
                 ("412 Precondition Failed", vec![])
+            } else if let Some(expected_etag) = if_match {
+                let current_etag = files
+                    .get(&path)
+                    .map(|existing| format!("\"{}\"", hex_sha(existing)));
+                if current_etag.as_deref() != Some(expected_etag.as_str()) {
+                    ("412 Precondition Failed", vec![])
+                } else {
+                    files.insert(path.clone(), body);
+                    ("201 Created", vec![])
+                }
             } else {
                 files.insert(path.clone(), body);
                 ("201 Created", vec![])
@@ -154,9 +169,12 @@ fn handle(
         _ => ("405 Method Not Allowed", vec![]),
     };
     drop(files);
+    let etag_header = response_etag
+        .map(|tag| format!("ETag: {tag}\r\n"))
+        .unwrap_or_default();
     let _ = write!(
         stream,
-        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\n{etag_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
         reply.len()
     );
     let _ = stream.write_all(&reply);
@@ -301,4 +319,95 @@ fn local_locations_do_not_open_remote_writers() {
     .unwrap();
     let id = registry.add(request).unwrap().id;
     assert!(registry.open_writer(&id).is_err());
+}
+
+#[test]
+fn remote_sidecar_read_and_write_enforce_xmp_safety_on_webdav_and_s3() {
+    for kind in ["webdav", "s3"] {
+        let server = serve(kind, Mode::Strict);
+        let (_data, registry, id) = registry(kind, &server);
+        let writer = registry.open_writer(&id).unwrap();
+        let browser = registry.open_browser(&id).unwrap();
+
+        // Non-.xmp keys are always refused so originals can never be touched.
+        assert!(writer.read_sidecar("album/a.NEF", 1024).is_err());
+        assert!(writer
+            .write_sidecar("album/a.NEF", b"x", None, true)
+            .is_err());
+        assert!(browser.read_sidecar("album/a.NEF", 1024).is_err());
+
+        assert!(writer
+            .read_sidecar("album/a.xmp", 2 * 1024 * 1024)
+            .unwrap()
+            .is_none());
+
+        writer
+            .write_sidecar("album/a.xmp", b"<xmp>v1</xmp>", None, true)
+            .unwrap();
+        // create_only refuses concurrent creation.
+        let conflict = writer
+            .write_sidecar("album/a.xmp", b"<xmp>race</xmp>", None, true)
+            .unwrap_err();
+        assert!(format!("{conflict:#}").contains("E_CONFLICT"));
+
+        let loaded = writer
+            .read_sidecar("album/a.xmp", 2 * 1024 * 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.bytes, b"<xmp>v1</xmp>");
+        assert_eq!(
+            browser
+                .read_sidecar("album/a.xmp", 2 * 1024 * 1024)
+                .unwrap()
+                .as_deref(),
+            Some(b"<xmp>v1</xmp>".as_slice())
+        );
+
+        // Update existing sidecar with matching ETag succeeds.
+        writer
+            .write_sidecar(
+                "album/a.xmp",
+                b"<xmp>v2</xmp>",
+                loaded.etag.as_deref(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            writer
+                .read_sidecar("album/a.xmp", 2 * 1024 * 1024)
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"<xmp>v2</xmp>"
+        );
+
+        // Stale ETag on S3 produces E_CONFLICT rather than silently clobbering.
+        if kind == "s3" {
+            let stale = writer
+                .write_sidecar("album/a.xmp", b"<xmp>stale</xmp>", Some("\"bad\""), false)
+                .unwrap_err();
+            assert!(format!("{stale:#}").contains("E_CONFLICT"));
+        }
+    }
+
+    // Legacy S3 without conditional headers falls back gracefully on existing sidecar updates.
+    let legacy = serve("s3", Mode::NoConditional);
+    let (_data, registry, id) = registry("s3", &legacy);
+    let writer = registry.open_writer(&id).unwrap();
+    legacy
+        .store
+        .lock()
+        .unwrap()
+        .insert("/root/bucket/a.xmp".into(), b"<xmp>old</xmp>".to_vec());
+    let loaded = writer
+        .read_sidecar("a.xmp", 2 * 1024 * 1024)
+        .unwrap()
+        .unwrap();
+    writer
+        .write_sidecar("a.xmp", b"<xmp>new</xmp>", loaded.etag.as_deref(), false)
+        .unwrap();
+    assert_eq!(
+        legacy.store.lock().unwrap()["/root/bucket/a.xmp"],
+        b"<xmp>new</xmp>"
+    );
 }

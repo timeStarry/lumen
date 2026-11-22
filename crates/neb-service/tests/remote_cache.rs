@@ -22,6 +22,7 @@ struct Request {
     method: String,
     ranged: bool,
     range_bytes: usize,
+    sidecar: bool,
 }
 #[derive(Default)]
 struct DownloadGate {
@@ -95,7 +96,7 @@ impl Server {
                 let mut parts = text.lines().next().unwrap().split_whitespace();
                 let method = parts.next().unwrap().to_owned();
                 let target = parts.next().unwrap();
-                assert!(target.starts_with("/album/"));
+                assert!(target.starts_with("/album/") || target == "/album");
                 let range = text
                     .lines()
                     .filter_map(|line| line.split_once(':'))
@@ -105,13 +106,15 @@ impl Server {
                         (start.parse::<usize>().unwrap(), end.parse::<usize>().unwrap())
                     });
                 let ranged = range.is_some();
+                let filename = served_filename.lock().unwrap().clone();
+                let is_sidecar = target != format!("/album/{filename}");
                 recorded.lock().unwrap().push(Request {
                     method: method.clone(),
                     ranged,
                     range_bytes: range.map_or(0, |(start, end)| end - start + 1),
+                    sidecar: is_sidecar,
                 });
                 let photo = served_photo.lock().unwrap().clone();
-                let filename = served_filename.lock().unwrap().clone();
                 let listing = format!("<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/album/{filename}</d:href><d:propstat><d:prop><d:getcontentlength>{}</d:getcontentlength><d:resourcetype/></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>", photo.len());
                 let range = range.filter(|_| method == "GET" && served_ranges.load(Ordering::SeqCst));
                 let (status, content_type, body) = if unavailable.load(Ordering::SeqCst) {
@@ -122,6 +125,10 @@ impl Server {
                     )
                 } else if method == "PROPFIND" {
                     ("207 Multi-Status", "application/xml", listing.as_bytes())
+                } else if is_sidecar && method == "GET" {
+                    ("404 Not Found", "text/plain", b"".as_slice())
+                } else if matches!(method.as_str(), "MKCOL" | "PUT" | "MOVE" | "DELETE") {
+                    ("201 Created", "text/plain", b"".as_slice())
                 } else if let Some((start,end)) = range {
                     assert!(start <= end && end < photo.len());
                     ("206 Partial Content", "application/octet-stream", &photo[start..=end])
@@ -133,7 +140,7 @@ impl Server {
                 };
                 let range_header = range.map(|(start,end)|format!("Content-Range: bytes {start}-{end}/{}\r\n",photo.len())).unwrap_or_default();
                 let reply = format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{range_header}ETag: \"synthetic-v1\"\r\nConnection: close\r\n\r\n", body.len());
-                if method == "GET" && !ranged {
+                if method == "GET" && !ranged && !is_sidecar {
                     let (lock, changed) = &*served_gate;
                     let mut gate = lock.lock().unwrap();
                     if gate.paused {
@@ -171,7 +178,7 @@ impl Server {
             .lock()
             .unwrap()
             .iter()
-            .filter(|request| request.method == "GET" && !request.ranged)
+            .filter(|request| request.method == "GET" && !request.ranged && !request.sidecar)
             .count()
     }
     fn count(&self) -> usize {

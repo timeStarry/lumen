@@ -1134,6 +1134,7 @@ impl Service {
             }
             "asset.rate" | "asset.flag" | "asset.label" | "asset.crop" | "asset.reset_crop" => {
                 self.core.dispatch(command, params.clone())?;
+                self.enqueue_remote_xmp_if_enabled(std::slice::from_ref(&id.to_owned()), false);
                 self.asset_value(&self.core.asset(id)?)
             }
             _ => self.core.dispatch(command, params),
