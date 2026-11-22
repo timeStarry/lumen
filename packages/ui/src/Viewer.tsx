@@ -1645,14 +1645,19 @@ export default function Viewer(props: {
         mode === 'write' ? 'asset.xmp.write' : 'asset.xmp.read',
         { ids: [target.id] },
       );
+      if (report.errors.length) {
+        setError(report.errors[0].message);
+        return;
+      }
       if (mode === 'read') {
         const refreshed = await execute<Asset>('asset.get', { id: target.id });
         await changed({ ...refreshed, preview_revision: Date.now() }, 'crop');
         setNotice(report.updated ? '已从 .xmp 同步标记与裁剪。' : '未检测到新的 .xmp 伴随变更。');
-      } else if (!report.errors.length) {
-        setNotice(`已写入 .xmp 伴随文件。`);
+      } else {
+        setNotice(
+          report.written ? '已写入 .xmp 伴随文件。' : '当前照片无标记变更，无需生成 .xmp 伴随文件。',
+        );
       }
-      if (report.errors.length) setError(report.errors[0].message);
     });
   }
   async function refreshOriginal() {

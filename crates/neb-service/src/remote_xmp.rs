@@ -189,6 +189,55 @@ fn worker_loop(
     }
 }
 
+fn parent_dir_of_key(key: &str) -> &str {
+    key.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("")
+}
+
+fn index_remote_dir_sidecars(
+    browser: &StorageBrowser,
+    parent_dir: &str,
+    max_pages: usize,
+) -> Option<HashMap<String, String>> {
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    let mut sidecars = HashMap::new();
+    for _ in 0..max_pages {
+        let page = browser.browse(parent_dir, 1000, cursor.as_deref()).ok()?;
+        for entry in page.entries {
+            if entry.is_dir {
+                continue;
+            }
+            let is_xmp = Path::new(&entry.key)
+                .extension()
+                .and_then(|v| v.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("xmp"));
+            if is_xmp {
+                sidecars.insert(entry.key.to_ascii_lowercase(), entry.key);
+            }
+        }
+        match page.next_cursor {
+            None => return Some(sidecars),
+            Some(next) => {
+                if !seen_cursors.insert(next.clone()) {
+                    return None;
+                }
+                cursor = Some(next);
+            }
+        }
+    }
+    None
+}
+
+fn match_indexed_sidecar(
+    dir_sidecars: &HashMap<String, String>,
+    source_key: &str,
+) -> Option<String> {
+    let candidates = xmp::sidecar_candidates_for_key(source_key)?;
+    candidates
+        .into_iter()
+        .find_map(|cand| dir_sidecars.get(&cand.to_ascii_lowercase()).cloned())
+}
+
 fn find_remote_sidecar(
     writer: &RemoteWriter,
     source_key: &str,
@@ -207,7 +256,16 @@ fn find_remote_sidecar(
 fn find_remote_sidecar_for_read(
     browser: &StorageBrowser,
     source_key: &str,
+    indexed_dir: Option<&HashMap<String, String>>,
 ) -> Result<Option<(String, Vec<u8>)>> {
+    if let Some(dir_map) = indexed_dir {
+        let Some(matched_key) = match_indexed_sidecar(dir_map, source_key) else {
+            return Ok(None);
+        };
+        return Ok(browser
+            .read_sidecar(&matched_key, xmp::MAX_XMP_BYTES)?
+            .map(|bytes| (matched_key, bytes)));
+    }
     let Some(candidates) = xmp::sidecar_candidates_for_key(source_key) else {
         return Ok(None);
     };
@@ -224,10 +282,27 @@ pub(crate) fn sync_remote_asset_xmp(
     asset: &Asset,
     force_keywords: bool,
 ) -> Result<Option<String>> {
+    sync_remote_asset_xmp_with_dir(writer, asset, force_keywords, None)
+}
+
+fn sync_remote_asset_xmp_with_dir(
+    writer: &RemoteWriter,
+    asset: &Asset,
+    force_keywords: bool,
+    indexed_dir: Option<&HashMap<String, String>>,
+) -> Result<Option<String>> {
     let Some(source_key) = asset.source_key.as_deref() else {
         return Ok(None);
     };
-    let existing = find_remote_sidecar(writer, source_key)?;
+    let existing = match indexed_dir {
+        Some(dir_map) => match match_indexed_sidecar(dir_map, source_key) {
+            Some(matched_key) => writer
+                .read_sidecar(&matched_key, xmp::MAX_XMP_BYTES)?
+                .map(|sidecar| (matched_key, sidecar)),
+            None => None,
+        },
+        None => find_remote_sidecar(writer, source_key)?,
+    };
     let target_key = match &existing {
         Some((key, _)) => key.clone(),
         None => xmp::default_sidecar_key_for_write(source_key)
@@ -288,9 +363,25 @@ impl Service {
             .expand_pair_members(ids)
             .unwrap_or_else(|_| ids.to_vec());
         let mut remote_items = Vec::new();
+        let mut seen_pair_targets = HashSet::new();
         for id in expanded {
             if let Ok(asset) = self.core.asset(&id) {
-                if asset.source_key.is_some() {
+                if let Some(source_key) = asset.source_key.as_deref() {
+                    let paired = self
+                        .core
+                        .library(&asset.library_id)
+                        .map(|lib| lib.pair_raw_jpeg)
+                        .unwrap_or(false);
+                    if paired {
+                        if let Some(default_key) = xmp::default_sidecar_key_for_write(source_key) {
+                            if !seen_pair_targets.insert((
+                                asset.library_id.clone(),
+                                default_key.to_ascii_lowercase(),
+                            )) {
+                                continue;
+                            }
+                        }
+                    }
                     remote_items.push((id, force_keywords));
                 }
             }
@@ -312,6 +403,7 @@ impl Service {
             library_id: Option<String>,
         }
         let args: TargetArgs = serde_json::from_value(params)?;
+        let library_wide = args.library_id.is_some();
         let assets = self
             .core
             .resolve_xmp_assets(args.ids.as_deref(), args.library_id.as_deref())?;
@@ -334,6 +426,23 @@ impl Service {
                 .dispatch("asset.xmp.write", json!({ "ids": local_ids }));
         }
 
+        // Drain pending auto-write items first so background writes never race manual sync.
+        let _ = self.remote_xmp.flush(Duration::from_secs(10));
+
+        if library_wide {
+            // In remote RAW+JPEG paired libraries, per-file marks live on the rated variant
+            // (typically the raster representative in the grid). Process marked / raster items
+            // before unmarked RAW siblings so shared `<stem>.xmp` sidecars are never clobbered.
+            let has_marks = |a: &Asset| {
+                a.rating > 0
+                    || a.flag != "none"
+                    || a.color_label != "none"
+                    || a.crop.is_some()
+                    || !a.keywords.is_empty()
+            };
+            remote_assets.sort_by_key(|a| (!has_marks(a), a.kind == "raw"));
+        }
+
         let mut written = 0usize;
         let mut skipped = 0usize;
         let mut failed: Vec<Value> = Vec::new();
@@ -349,11 +458,10 @@ impl Service {
         }
 
         let mut writers: HashMap<String, Result<RemoteWriter, String>> = HashMap::new();
+        let mut browsers: HashMap<String, Option<StorageBrowser>> = HashMap::new();
         let mut lib_storage: HashMap<String, Option<String>> = HashMap::new();
-        let mut seen_sidecars: HashSet<(String, String)> = HashSet::new();
-
-        for asset in remote_assets {
-            let source_key = asset.source_key.as_deref().unwrap_or_default().to_owned();
+        let mut dir_counts: HashMap<(String, String), usize> = HashMap::new();
+        for asset in &remote_assets {
             let storage_id = match lib_storage.get(&asset.library_id) {
                 Some(cached) => cached.clone(),
                 None => {
@@ -366,7 +474,20 @@ impl Service {
                     resolved
                 }
             };
-            let Some(storage_id) = storage_id else {
+            if let (Some(storage_id), Some(source_key)) = (storage_id, asset.source_key.as_deref())
+            {
+                let parent = parent_dir_of_key(source_key).to_owned();
+                *dir_counts.entry((storage_id, parent)).or_insert(0) += 1;
+            }
+        }
+
+        let mut dir_indexes: HashMap<(String, String), Option<HashMap<String, String>>> =
+            HashMap::new();
+        let mut seen_sidecars: HashSet<(String, String)> = HashSet::new();
+
+        for asset in remote_assets {
+            let source_key = asset.source_key.as_deref().unwrap_or_default().to_owned();
+            let Some(storage_id) = lib_storage.get(&asset.library_id).cloned().flatten() else {
                 failed.push(json!({
                     "id": asset.id,
                     "path": source_key,
@@ -374,12 +495,40 @@ impl Service {
                 }));
                 continue;
             };
-            if let Some(default_key) = xmp::default_sidecar_key_for_write(&source_key) {
-                if !seen_sidecars.insert((storage_id.clone(), default_key.to_ascii_lowercase())) {
+            let parent = parent_dir_of_key(&source_key).to_owned();
+            let dir_key = (storage_id.clone(), parent.clone());
+            let count = dir_counts.get(&dir_key).copied().unwrap_or(0);
+            let indexed_dir = if library_wide || count >= 2 {
+                dir_indexes
+                    .entry(dir_key)
+                    .or_insert_with(|| {
+                        let browser = browsers
+                            .entry(storage_id.clone())
+                            .or_insert_with(|| {
+                                self.storage
+                                    .lock()
+                                    .ok()
+                                    .and_then(|reg| reg.open_browser(&storage_id).ok())
+                            })
+                            .as_ref()?;
+                        let max_pages = if library_wide || count >= 4 { 64 } else { 2 };
+                        index_remote_dir_sidecars(browser, &parent, max_pages)
+                    })
+                    .as_ref()
+            } else {
+                None
+            };
+
+            let dedup_target = indexed_dir
+                .and_then(|map| match_indexed_sidecar(map, &source_key))
+                .or_else(|| xmp::default_sidecar_key_for_write(&source_key));
+            if let Some(target_key) = dedup_target {
+                if !seen_sidecars.insert((storage_id.clone(), target_key.to_ascii_lowercase())) {
                     skipped += 1;
                     continue;
                 }
             }
+
             let writer_res = writers.entry(storage_id.clone()).or_insert_with(|| {
                 self.storage
                     .lock()
@@ -397,7 +546,7 @@ impl Service {
                     continue;
                 }
             };
-            match sync_remote_asset_xmp(writer, &asset, false) {
+            match sync_remote_asset_xmp_with_dir(writer, &asset, true, indexed_dir) {
                 Ok(Some(_)) => written += 1,
                 Ok(None) => skipped += 1,
                 Err(error) => failed.push(json!({
@@ -422,6 +571,7 @@ impl Service {
             library_id: Option<String>,
         }
         let args: TargetArgs = serde_json::from_value(params)?;
+        let library_wide = args.library_id.is_some();
         let assets = self
             .core
             .resolve_xmp_assets(args.ids.as_deref(), args.library_id.as_deref())?;
@@ -448,6 +598,9 @@ impl Service {
             return Ok(value);
         }
 
+        // Drain pending auto-write items first so stale remote sidecars do not clobber fresh marks.
+        let _ = self.remote_xmp.flush(Duration::from_secs(10));
+
         let mut updated = 0usize;
         let mut skipped = 0usize;
         let mut failed: Vec<Value> = Vec::new();
@@ -464,10 +617,8 @@ impl Service {
 
         let mut browsers: HashMap<String, Result<StorageBrowser, String>> = HashMap::new();
         let mut lib_storage: HashMap<String, Option<String>> = HashMap::new();
-        let mut pending_updates = Vec::new();
-
-        for asset in remote_assets {
-            let source_key = asset.source_key.as_deref().unwrap_or_default().to_owned();
+        let mut dir_counts: HashMap<(String, String), usize> = HashMap::new();
+        for asset in &remote_assets {
             let storage_id = match lib_storage.get(&asset.library_id) {
                 Some(cached) => cached.clone(),
                 None => {
@@ -480,7 +631,21 @@ impl Service {
                     resolved
                 }
             };
-            let Some(storage_id) = storage_id else {
+            if let (Some(storage_id), Some(source_key)) = (storage_id, asset.source_key.as_deref())
+            {
+                let parent = parent_dir_of_key(source_key).to_owned();
+                *dir_counts.entry((storage_id, parent)).or_insert(0) += 1;
+            }
+        }
+
+        let mut dir_indexes: HashMap<(String, String), Option<HashMap<String, String>>> =
+            HashMap::new();
+        let mut sidecar_cache: HashMap<(String, String), Vec<u8>> = HashMap::new();
+        let mut pending_updates = Vec::new();
+
+        for asset in remote_assets {
+            let source_key = asset.source_key.as_deref().unwrap_or_default().to_owned();
+            let Some(storage_id) = lib_storage.get(&asset.library_id).cloned().flatten() else {
                 failed.push(json!({
                     "id": asset.id,
                     "path": source_key,
@@ -505,7 +670,42 @@ impl Service {
                     continue;
                 }
             };
-            match find_remote_sidecar_for_read(browser, &source_key) {
+            let parent = parent_dir_of_key(&source_key).to_owned();
+            let dir_key = (storage_id.clone(), parent.clone());
+            let count = dir_counts.get(&dir_key).copied().unwrap_or(0);
+            let indexed_dir = if library_wide || count >= 2 {
+                dir_indexes
+                    .entry(dir_key)
+                    .or_insert_with(|| {
+                        let max_pages = if library_wide || count >= 4 { 64 } else { 2 };
+                        index_remote_dir_sidecars(browser, &parent, max_pages)
+                    })
+                    .as_ref()
+            } else {
+                None
+            };
+
+            let loaded = if let Some(matched_key) =
+                indexed_dir.and_then(|map| match_indexed_sidecar(map, &source_key))
+            {
+                let cache_key = (storage_id.clone(), matched_key.clone());
+                if let Some(cached) = sidecar_cache.get(&cache_key) {
+                    Ok(Some((matched_key, cached.clone())))
+                } else {
+                    match browser.read_sidecar(&matched_key, xmp::MAX_XMP_BYTES) {
+                        Ok(Some(bytes)) => {
+                            sidecar_cache.insert(cache_key, bytes.clone());
+                            Ok(Some((matched_key, bytes)))
+                        }
+                        Ok(None) => Ok(None),
+                        Err(e) => Err(e),
+                    }
+                }
+            } else {
+                find_remote_sidecar_for_read(browser, &source_key, indexed_dir)
+            };
+
+            match loaded {
                 Ok(Some((_, bytes))) => match xmp::parse_xmp_bytes(&bytes) {
                     Ok(sidecar) => {
                         if let Some(update) = neb_core::compute_xmp_update(&asset, sidecar) {

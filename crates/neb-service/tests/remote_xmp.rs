@@ -383,7 +383,13 @@ fn remote_webdav_and_s3_libraries_sync_xmp_on_scan_auto_write_and_manual_command
             4
         );
 
-        // Now change DSC_0200 to 2 stars and write whole library manually.
+        // Now clear DSC_0100's keywords while auto-write is OFF, change DSC_0200 to 2 stars,
+        // and write whole library manually — removed keywords must be stripped from DSC_0100.xmp.
+        svc.execute(
+            "asset.keywords.set",
+            json!({"ids": [id_100], "remove": ["人像 > 客片"]}),
+        )
+        .unwrap();
         svc.execute("asset.rate", json!({"id": id_200, "rating": 2}))
             .unwrap();
         let write_report = svc
@@ -394,13 +400,20 @@ fn remote_webdav_and_s3_libraries_sync_xmp_on_scan_auto_write_and_manual_command
         assert_eq!(write_report["errors"].as_array().unwrap().len(), 0);
         {
             let store = server.store.lock().unwrap();
+            let parsed_100 =
+                xmp::parse_xmp_str(std::str::from_utf8(&store[&key_sidecar]).unwrap()).unwrap();
+            assert!(
+                parsed_100.keywords.is_empty(),
+                "deleted keywords must be stripped on manual asset.xmp.write: {:?}",
+                parsed_100.keywords
+            );
             let parsed_200 =
                 xmp::parse_xmp_str(std::str::from_utf8(&store[&key_plain_sidecar]).unwrap())
                     .unwrap();
             assert_eq!(parsed_200.rating, Some(2));
         }
 
-        // 4. Read-only server (403): auto-write never breaks catalog mutations, while manual write reports error.
+        // 4. Read-only server (403): auto-write never breaks catalog mutations or poisons read availability!
         server.read_only.store(true, Ordering::Relaxed);
         svc.execute("xmp.policy.set", json!({"auto_write": true}))
             .unwrap();
@@ -412,5 +425,105 @@ fn remote_webdav_and_s3_libraries_sync_xmp_on_scan_auto_write_and_manual_command
             .unwrap();
         assert_eq!(err_report["written"], 0);
         assert_eq!(err_report["errors"].as_array().unwrap().len(), 1);
+        let libs = svc.execute("library.list", json!({})).unwrap();
+        assert_eq!(
+            libs[0]["availability"], "online",
+            "read-only 403 on sidecar write must not poison library availability to auth_required ({kind}): {libs}"
+        );
+        assert_eq!(libs[0]["connected"], true);
+
+        // 5. Remote RAW + JPEG paired library (`pair_raw_jpeg: true`) + mixed-case sidecar sync.
+        server.read_only.store(false, Ordering::Relaxed);
+        let pair_nef = format!("{prefix_root}/paired/DSC_0888.NEF");
+        let pair_jpg = format!("{prefix_root}/paired/DSC_0888.JPG");
+        let pair_xmp = format!("{prefix_root}/paired/DSC_0888.xmp");
+        let mixed_nef = format!("{prefix_root}/paired/DSC_0900.NEF");
+        let mixed_xmp = format!("{prefix_root}/paired/dsc_0900.Xmp");
+        {
+            let mut store = server.store.lock().unwrap();
+            store.insert(pair_nef.clone(), b"pair-raw".to_vec());
+            store.insert(pair_jpg.clone(), b"pair-jpg".to_vec());
+            store.insert(mixed_nef.clone(), b"mixed-raw".to_vec());
+            store.insert(mixed_xmp.clone(), adobe_xmp.as_bytes().to_vec());
+        }
+        let paired_lib = svc
+            .execute(
+                "library.add",
+                json!({
+                    "name": "Paired NAS",
+                    "storage_id": source["id"],
+                    "prefix": "paired",
+                    "pair_raw_jpeg": true
+                }),
+            )
+            .unwrap();
+        let paired_lib_id = paired_lib["id"].as_str().unwrap();
+        let paired_scan = svc
+            .execute("library.scan", json!({"library_id": paired_lib_id}))
+            .unwrap();
+        assert_eq!(paired_scan["indexed"], 3, "{paired_scan}");
+
+        let paired_list = svc
+            .execute("asset.list", json!({"library_id": paired_lib_id}))
+            .unwrap();
+        let paired_items = paired_list["items"].as_array().unwrap();
+        assert_eq!(paired_items.len(), 2, "RAW+JPEG must collapse to 1 card");
+        let pair_rep = paired_items
+            .iter()
+            .find(|a| a["filename"].as_str().unwrap().starts_with("DSC_0888"))
+            .unwrap();
+        let rep_id = pair_rep["id"].as_str().unwrap().to_owned();
+        let rep_detail = svc.execute("asset.get", json!({"id": rep_id})).unwrap();
+        let variants = rep_detail["variants"].as_array().unwrap();
+        let raw_id = variants[0]["id"].as_str().unwrap().to_owned();
+        let jpg_id = variants[1]["id"].as_str().unwrap().to_owned();
+
+        // Rating and cropping the grid representative writes shared `DSC_0888.xmp` and is never clobbered by unmarked RAW on library write.
+        svc.execute("asset.rate", json!({"id": jpg_id, "rating": 5}))
+            .unwrap();
+        svc.execute(
+            "asset.crop",
+            json!({"id": jpg_id, "x": 0.05, "y": 0.1, "width": 0.8, "height": 0.7}),
+        )
+        .unwrap();
+        assert!(svc.flush_remote_xmp(Duration::from_secs(5)));
+
+        let paired_write = svc
+            .execute("asset.xmp.write", json!({"library_id": paired_lib_id}))
+            .unwrap();
+        assert_eq!(paired_write["written"], 2, "{paired_write}");
+        assert_eq!(paired_write["skipped"], 1, "{paired_write}");
+        {
+            let store = server.store.lock().unwrap();
+            let parsed_pair =
+                xmp::parse_xmp_str(std::str::from_utf8(&store[&pair_xmp]).unwrap()).unwrap();
+            assert_eq!(parsed_pair.rating, Some(5));
+            assert!(parsed_pair.crop.flatten().is_some());
+            // Mixed-case `dsc_0900.Xmp` must be updated in place rather than duplicated as `DSC_0900.xmp`.
+            assert!(store.contains_key(&mixed_xmp));
+            assert!(!store.contains_key(&format!("{prefix_root}/paired/DSC_0900.xmp")));
+        }
+
+        // External update to `DSC_0888.xmp` read via `[jpg_id]` must update both JPEG and RAW halves.
+        {
+            let mut store = server.store.lock().unwrap();
+            let prev_xml = std::str::from_utf8(&store[&pair_xmp]).unwrap().to_owned();
+            let updated_bytes =
+                xmp::prepare_sidecar_bytes(Some(&prev_xml), 2, "pick", Some("green"), None, None)
+                    .unwrap()
+                    .unwrap();
+            store.insert(pair_xmp, updated_bytes);
+        }
+        let paired_read = svc
+            .execute("asset.xmp.read", json!({"ids": [jpg_id]}))
+            .unwrap();
+        assert_eq!(paired_read["updated"], 2, "{paired_read}");
+        for member_id in [&raw_id, &jpg_id] {
+            let member = svc.execute("asset.get", json!({"id": member_id})).unwrap();
+            assert_eq!(member["rating"], 2);
+            assert_eq!(member["flag"], "pick");
+            assert_eq!(member["color_label"], "green");
+            assert!(member["crop"].is_null());
+        }
     }
 }

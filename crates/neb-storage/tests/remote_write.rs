@@ -19,6 +19,10 @@ enum Mode {
     ForbidGet,
     /// S3 without conditional-write support.
     NoConditional,
+    /// Simulates NAS WebDAV shared-folder root where MKCOL returns 403 but PUT/MOVE in existing dir works.
+    ForbidMkcol,
+    /// Simulates read-only credentials where GET succeeds (200/404) and PUT/MOVE/MKCOL return 403.
+    ReadOnlyWrites,
 }
 
 type Store = Arc<Mutex<HashMap<String, Vec<u8>>>>;
@@ -120,6 +124,8 @@ fn handle(
             files.remove(&path);
             ("204 No Content", vec![])
         }
+        _ if mode == Mode::ReadOnlyWrites => ("403 Forbidden", vec![]),
+        "MKCOL" if mode == Mode::ForbidMkcol => ("403 Forbidden", vec![]),
         "MKCOL" => ("201 Created", vec![]),
         "PUT" => {
             let conditional = headers.get("if-none-match").map(String::as_str) == Some("*");
@@ -390,10 +396,17 @@ fn remote_sidecar_read_and_write_enforce_xmp_safety_on_webdav_and_s3() {
         }
     }
 
-    // Legacy S3 without conditional headers falls back gracefully on existing sidecar updates.
+    // Legacy S3 without conditional headers falls back gracefully on both new and existing sidecars.
     let legacy = serve("s3", Mode::NoConditional);
-    let (_data, registry, id) = registry("s3", &legacy);
-    let writer = registry.open_writer(&id).unwrap();
+    let (_data, registry_legacy, id) = registry("s3", &legacy);
+    let writer = registry_legacy.open_writer(&id).unwrap();
+    writer
+        .write_sidecar("fresh.xmp", b"<xmp>created</xmp>", None, true)
+        .unwrap();
+    assert_eq!(
+        legacy.store.lock().unwrap()["/root/bucket/fresh.xmp"],
+        b"<xmp>created</xmp>"
+    );
     legacy
         .store
         .lock()
@@ -410,4 +423,36 @@ fn remote_sidecar_read_and_write_enforce_xmp_safety_on_webdav_and_s3() {
         legacy.store.lock().unwrap()["/root/bucket/a.xmp"],
         b"<xmp>new</xmp>"
     );
+
+    // NAS WebDAV shared folders that forbid MKCOL on ancestor roots still accept sidecars beside existing media.
+    let nas_dav = serve("webdav", Mode::ForbidMkcol);
+    let (_data, registry_dav, id_dav) = registry("webdav", &nas_dav);
+    let dav_writer = registry_dav.open_writer(&id_dav).unwrap();
+    dav_writer
+        .write_sidecar("photo/2026/trip/a.xmp", b"<xmp>nas</xmp>", None, true)
+        .unwrap();
+    assert_eq!(
+        nas_dav.store.lock().unwrap()["/root/photo/2026/trip/a.xmp"],
+        b"<xmp>nas</xmp>"
+    );
+
+    // Read-only WebDAV / S3 shares rejecting writes with HTTP 403 must keep availability online.
+    for kind in ["webdav", "s3"] {
+        let ro_server = serve(kind, Mode::ReadOnlyWrites);
+        let (_data, ro_reg, ro_id) = registry(kind, &ro_server);
+        let ro_writer = ro_reg.open_writer(&ro_id).unwrap();
+        assert!(ro_writer
+            .read_sidecar("album/a.xmp", 1024)
+            .unwrap()
+            .is_none());
+        assert_eq!(ro_reg.list()[0].availability, "online");
+        assert!(ro_writer
+            .write_sidecar("album/a.xmp", b"<xmp>ro</xmp>", None, true)
+            .is_err());
+        assert_eq!(
+            ro_reg.list()[0].availability,
+            "online",
+            "sidecar write 403 must not poison read availability to auth_required ({kind})"
+        );
+    }
 }

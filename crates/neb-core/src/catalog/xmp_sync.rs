@@ -137,18 +137,13 @@ impl Core {
                     continue;
                 }
             }
-            let kw_arg = if asset.keywords.is_empty() {
-                None
-            } else {
-                Some(asset.keywords.as_slice())
-            };
             match xmp::write_sidecar_for_image_with_tags(
                 &path,
                 asset.rating,
                 &asset.flag,
                 Some(&asset.color_label),
                 asset.crop,
-                kw_arg,
+                Some(asset.keywords.as_slice()),
             ) {
                 Ok(Some(_)) => written += 1,
                 Ok(None) => skipped += 1,
@@ -306,7 +301,7 @@ impl Core {
                 (1..=5000).contains(&ids.len()),
                 "E_INVALID: XMP batch must name 1 to 5000 assets"
             );
-            let expanded = self.with_pair_members(ids)?;
+            let expanded = self.expand_pair_members(ids)?;
             let mut out = Vec::with_capacity(expanded.len());
             for id in expanded {
                 out.push(self.asset(&id)?);

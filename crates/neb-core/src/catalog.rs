@@ -2171,7 +2171,21 @@ impl Core {
     }
 
     pub fn expand_pair_members(&self, ids: &[String]) -> Result<Vec<String>> {
-        self.with_pair_members(ids)
+        let mut members = Vec::with_capacity(ids.len());
+        for id in ids {
+            let asset = self.asset(id)?;
+            if !members.contains(&asset.id) {
+                members.push(asset.id.clone());
+            }
+            if self.library(&asset.library_id)?.pair_raw_jpeg {
+                if let Some(partner) = self.pair_partner_entry(&asset)? {
+                    if !members.contains(&partner.id) {
+                        members.push(partner.id);
+                    }
+                }
+            }
+        }
+        Ok(members)
     }
     pub fn library_summaries(&self) -> Result<HashMap<String, Value>> {
         let db = self.db()?;
