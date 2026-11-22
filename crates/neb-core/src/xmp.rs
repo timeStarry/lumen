@@ -151,6 +151,54 @@ fn is_regular_sidecar(path: &Path) -> bool {
         .is_some_and(|meta| meta.file_type().is_file() && meta.len() <= MAX_XMP_BYTES)
 }
 
+/// Candidate `.xmp` sidecar keys for a portable slash-separated `source_key`,
+/// ordered to match `find_sidecar_for_read` (`<stem>.xmp`, `<stem>.XMP`, `<filename>.xmp`, `<filename>.XMP`).
+pub fn sidecar_candidates_for_key(key: &str) -> Option<Vec<String>> {
+    let (dir, filename) = match key.rsplit_once('/') {
+        Some((dir, name)) => (Some(dir), name),
+        None => (None, key),
+    };
+    if filename.is_empty() {
+        return None;
+    }
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())?;
+    let qualify = |leaf: String| match dir {
+        Some(dir) if !dir.is_empty() => format!("{dir}/{leaf}"),
+        _ => leaf,
+    };
+    let mut out = Vec::with_capacity(4);
+    for leaf in [
+        format!("{stem}.xmp"),
+        format!("{stem}.XMP"),
+        format!("{filename}.xmp"),
+        format!("{filename}.XMP"),
+    ] {
+        let candidate = qualify(leaf);
+        if !out.contains(&candidate) {
+            out.push(candidate);
+        }
+    }
+    Some(out)
+}
+
+/// Default `.xmp` sidecar key (`<dir>/<stem>.xmp`) when creating a new remote sidecar.
+pub fn default_sidecar_key_for_write(key: &str) -> Option<String> {
+    sidecar_candidates_for_key(key).and_then(|mut list| list.drain(..).next())
+}
+
+/// Parse an `.xmp` sidecar from bounded UTF-8 bytes.
+pub fn parse_xmp_bytes(bytes: &[u8]) -> Result<SidecarData> {
+    ensure!(
+        bytes.len() as u64 <= MAX_XMP_BYTES,
+        "E_LIMIT: XMP sidecar exceeds 2 MiB limit"
+    );
+    let xml = std::str::from_utf8(bytes).context("E_INVALID: XMP sidecar is not valid UTF-8")?;
+    parse_xmp_str(xml)
+}
+
 /// Parse rating, pick/reject flag, label, and axis-aligned normalized crop from an image's `.xmp`.
 pub fn read_sidecar_for_image(image_path: &Path) -> Result<Option<SidecarData>> {
     let Some(sidecar_path) = find_sidecar_for_read(image_path) else {
@@ -396,15 +444,16 @@ pub fn write_sidecar_for_image(
     write_sidecar_for_image_with_tags(image_path, rating, flag, None, crop, None)
 }
 
-/// Atomically write or update `<stem>.xmp` including color label (`xmp:Label`) and hierarchical keywords.
-pub fn write_sidecar_for_image_with_tags(
-    image_path: &Path,
+/// Validate and serialize updated or newly created `.xmp` bytes from catalog metadata.
+/// Returns `Ok(None)` when no sidecar existed and the asset has only default state.
+pub fn prepare_sidecar_bytes(
+    existing_xml: Option<&str>,
     rating: u8,
     flag: &str,
     color_label: Option<&str>,
     crop: Option<Crop>,
     keywords: Option<&[String]>,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<Vec<u8>>> {
     ensure!(rating <= 5, "E_INVALID: Rating must be 0..=5");
     ensure!(
         matches!(flag, "none" | "pick" | "reject"),
@@ -433,10 +482,9 @@ pub fn write_sidecar_for_image_with_tags(
         out
     });
 
-    let existing_path = find_sidecar_for_read(image_path);
     let is_default_label = normalized_label.is_none_or(|l| l == "none");
     let is_empty_keywords = cleaned_keywords.as_ref().is_none_or(Vec::is_empty);
-    if existing_path.is_none()
+    if existing_xml.is_none()
         && rating == 0
         && flag == "none"
         && is_default_label
@@ -446,31 +494,14 @@ pub fn write_sidecar_for_image_with_tags(
         return Ok(None);
     }
 
-    let target_path = match &existing_path {
-        Some(p) => p.clone(),
-        None => sidecar_path_for_write(image_path)?,
-    };
-    let parent = target_path
-        .parent()
-        .context("E_INVALID: Sidecar target has no parent directory")?;
-    ensure!(parent.is_dir(), "E_OFFLINE: Image folder is unavailable");
-
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    let xml_bytes = if let Some(existing) = &existing_path {
-        let meta =
-            fs::symlink_metadata(existing).context("E_IO: Cannot inspect existing XMP sidecar")?;
+    let xml_bytes = if let Some(original_xml) = existing_xml {
         ensure!(
-            meta.file_type().is_file(),
-            "E_INVALID: Existing XMP sidecar is not a regular file"
-        );
-        ensure!(
-            meta.len() <= MAX_XMP_BYTES,
+            original_xml.len() as u64 <= MAX_XMP_BYTES,
             "E_LIMIT: Existing XMP sidecar exceeds 2 MiB limit"
         );
-        let original_xml =
-            fs::read_to_string(existing).context("E_IO: Cannot read existing XMP sidecar")?;
         merge_xmp_str_with_tags(
-            &original_xml,
+            original_xml,
             rating,
             flag,
             normalized_label,
@@ -489,6 +520,56 @@ pub fn write_sidecar_for_image_with_tags(
         )
         .into_bytes()
     };
+    Ok(Some(xml_bytes))
+}
+
+/// Atomically write or update `<stem>.xmp` including color label (`xmp:Label`) and hierarchical keywords.
+pub fn write_sidecar_for_image_with_tags(
+    image_path: &Path,
+    rating: u8,
+    flag: &str,
+    color_label: Option<&str>,
+    crop: Option<Crop>,
+    keywords: Option<&[String]>,
+) -> Result<Option<PathBuf>> {
+    let existing_path = find_sidecar_for_read(image_path);
+    let existing_xml = match &existing_path {
+        Some(existing) => {
+            let meta = fs::symlink_metadata(existing)
+                .context("E_IO: Cannot inspect existing XMP sidecar")?;
+            ensure!(
+                meta.file_type().is_file(),
+                "E_INVALID: Existing XMP sidecar is not a regular file"
+            );
+            ensure!(
+                meta.len() <= MAX_XMP_BYTES,
+                "E_LIMIT: Existing XMP sidecar exceeds 2 MiB limit"
+            );
+            Some(fs::read_to_string(existing).context("E_IO: Cannot read existing XMP sidecar")?)
+        }
+        None => None,
+    };
+
+    let Some(xml_bytes) = prepare_sidecar_bytes(
+        existing_xml.as_deref(),
+        rating,
+        flag,
+        color_label,
+        crop,
+        keywords,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    let target_path = match &existing_path {
+        Some(p) => p.clone(),
+        None => sidecar_path_for_write(image_path)?,
+    };
+    let parent = target_path
+        .parent()
+        .context("E_INVALID: Sidecar target has no parent directory")?;
+    ensure!(parent.is_dir(), "E_OFFLINE: Image folder is unavailable");
 
     let mut temp = tempfile::Builder::new()
         .prefix(".neb-xmp-")

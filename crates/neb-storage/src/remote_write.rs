@@ -5,7 +5,7 @@
 //! refused rather than written to best-effort.
 use crate::{
     availability::{classify, Availability, AvailabilityCell},
-    remote, validate_key, Credentials, StorageConfig,
+    remote, validate_key, validate_xmp_key, Credentials, StorageConfig,
 };
 use anyhow::{bail, ensure, Result};
 use reqwest::{
@@ -27,6 +27,14 @@ use uuid::Uuid;
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 /// S3 single-request upload limit.
 const S3_SINGLE_PUT_LIMIT: u64 = 5 * 1024 * 1024 * 1024;
+/// Maximum `.xmp` sidecar payload size supported for remote sync (2 MiB).
+const MAX_SIDECAR_BYTES: u64 = 2 * 1024 * 1024;
+
+#[derive(Clone, Debug)]
+pub struct RemoteSidecar {
+    pub bytes: Vec<u8>,
+    pub etag: Option<String>,
+}
 
 struct StreamHashState {
     bytes_read: u64,
@@ -142,6 +150,22 @@ impl RemoteWriter {
         match &result {
             Ok(_) => self.availability.set(Availability::Online),
             Err(error) if !code(error) => self.availability.set(classify(error)),
+            Err(_) => {}
+        }
+        result
+    }
+
+    /// Sidecar writes on read-only WebDAV shares or read-only S3 IAM policies fail with
+    /// HTTP 403 / 405 even when read credentials are valid; never poison read availability.
+    fn track_sidecar_write<T>(&self, result: Result<T>) -> Result<T> {
+        match &result {
+            Ok(_) => self.availability.set(Availability::Online),
+            Err(error) if !code(error) => {
+                let lower = format!("{error:#}").to_ascii_lowercase();
+                if !lower.contains("http 403") && !lower.contains("http 405") {
+                    self.availability.set(classify(error));
+                }
+            }
             Err(_) => {}
         }
         result
@@ -296,12 +320,123 @@ impl RemoteWriter {
         Ok(())
     }
 
+    /// Read an `.xmp` sidecar from WebDAV or S3. Returns `Ok(None)` when absent.
+    pub fn read_sidecar(&self, key: &str, max_bytes: u64) -> Result<Option<RemoteSidecar>> {
+        validate_xmp_key(key)?;
+        self.track(
+            remote::read_sidecar_bytes(
+                &self.client,
+                &self.config,
+                &self.credentials,
+                key,
+                max_bytes,
+            )
+            .map(|opt| opt.map(|(bytes, etag)| RemoteSidecar { bytes, etag })),
+        )
+    }
+
+    /// Create or atomically update an `.xmp` sidecar without ever touching non-`.xmp` keys.
+    /// When `create_only` is true, refuses to overwrite if a sidecar appeared concurrently (`E_CONFLICT`).
+    pub fn write_sidecar(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        expected_etag: Option<&str>,
+        create_only: bool,
+    ) -> Result<()> {
+        validate_xmp_key(key)?;
+        let size = bytes.len() as u64;
+        ensure!(
+            size <= MAX_SIDECAR_BYTES,
+            "E_LIMIT: Remote XMP sidecar exceeds 2 MiB limit"
+        );
+        let sha256 = hex::encode(Sha256::digest(bytes));
+        self.track_sidecar_write(match self.config.kind.as_str() {
+            "webdav" => self.dav_put_sidecar(key, bytes, &sha256, !create_only),
+            "s3" => self.s3_put_sidecar(key, bytes, &sha256, expected_etag, create_only),
+            _ => bail!("E_UNSUPPORTED: Only WebDAV and S3 locations accept remote writes"),
+        })
+    }
+
+    fn dav_put_sidecar(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        expected_sha256: &str,
+        overwrite: bool,
+    ) -> Result<()> {
+        let parent = key.rsplit_once('/').map(|(parent, _)| parent);
+        let name = format!(".nebulume-{}.part", Uuid::new_v4());
+        let temporary = match parent {
+            Some(parent) => format!("{parent}/{name}"),
+            None => name,
+        };
+        let upload_temp = || -> Result<StatusCode> {
+            let response = self
+                .dav(Method::PUT, &temporary)?
+                .header("If-None-Match", "*")
+                .body(Body::sized(Cursor::new(bytes.to_vec()), bytes.len() as u64))
+                .send()?;
+            Ok(response.status())
+        };
+        // Sidecars sit beside an existing original, so avoid upfront MKCOL on ancestor
+        // shared folders (which return 403 on Synology / QNAP / restricted shares).
+        // Fall back to MKCOL only when PUT indicates a missing parent collection.
+        let mut status = upload_temp()?;
+        if matches!(status, StatusCode::CONFLICT | StatusCode::NOT_FOUND) {
+            if let Some(parent) = parent {
+                self.dav_collections(parent)?;
+                status = upload_temp()?;
+            }
+        }
+        if !status.is_success() {
+            bail!("Storage request failed with HTTP {}", status.as_u16());
+        }
+        let outcome = (|| -> Result<()> {
+            let actual_hash = hex::encode(Sha256::digest(bytes));
+            ensure!(
+                actual_hash.eq_ignore_ascii_case(expected_sha256),
+                "E_VERIFY: Source content did not match planned SHA-256"
+            );
+            let destination = remote::url_for(&self.config, key)?;
+            let moved = self
+                .dav(Method::from_bytes(b"MOVE")?, &temporary)?
+                .header("Destination", destination.as_str())
+                .header("Overwrite", if overwrite { "T" } else { "F" })
+                .send()?;
+            match moved.status() {
+                s if s.is_success() => Ok(()),
+                StatusCode::PRECONDITION_FAILED => {
+                    bail!("E_CONFLICT: {key} already exists on the server")
+                }
+                s => bail!("Storage request failed with HTTP {}", s.as_u16()),
+            }
+        })();
+        if outcome.is_err() {
+            if let Ok(request) = self.dav(Method::DELETE, &temporary) {
+                let _ = request.send();
+            }
+        }
+        outcome
+    }
+
     fn dav_put_new<R: Read + Send + 'static>(
         &self,
         key: &str,
         body: R,
         size: u64,
         expected_sha256: Option<&str>,
+    ) -> Result<String> {
+        self.dav_put_via_temp(key, body, size, expected_sha256, false)
+    }
+
+    fn dav_put_via_temp<R: Read + Send + 'static>(
+        &self,
+        key: &str,
+        body: R,
+        size: u64,
+        expected_sha256: Option<&str>,
+        overwrite: bool,
     ) -> Result<String> {
         let parent = key.rsplit_once('/').map(|(parent, _)| parent);
         if let Some(parent) = parent {
@@ -353,7 +488,7 @@ impl RemoteWriter {
             let moved = self
                 .dav(Method::from_bytes(b"MOVE")?, &temporary)?
                 .header("Destination", destination.as_str())
-                .header("Overwrite", "F")
+                .header("Overwrite", if overwrite { "T" } else { "F" })
                 .send()?;
             match moved.status() {
                 status if status.is_success() => Ok(actual_hash),
@@ -370,6 +505,60 @@ impl RemoteWriter {
             }
         }
         outcome
+    }
+
+    fn s3_put_sidecar(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        sha256: &str,
+        expected_etag: Option<&str>,
+        create_only: bool,
+    ) -> Result<()> {
+        let strong_etag = expected_etag.filter(|etag| !etag.starts_with("W/"));
+        let send = |use_condition: bool| -> Result<(StatusCode, String)> {
+            let mut request = self.s3(Method::PUT, key, sha256)?;
+            if use_condition {
+                if create_only {
+                    request = request.header("If-None-Match", "*");
+                } else if let Some(etag) = strong_etag {
+                    request = request.header("If-Match", etag);
+                }
+            }
+            let response = request
+                .body(Body::sized(Cursor::new(bytes.to_vec()), bytes.len() as u64))
+                .send()?;
+            let status = response.status();
+            let text = if status.is_success() {
+                String::new()
+            } else {
+                response.text().unwrap_or_default()
+            };
+            Ok((status, text))
+        };
+
+        let had_condition = create_only || strong_etag.is_some();
+        let (mut status, mut text) = send(had_condition)?;
+        if had_condition
+            && (status == StatusCode::NOT_IMPLEMENTED
+                || (status == StatusCode::BAD_REQUEST && text.contains("NotImplemented")))
+        {
+            (status, text) = send(false)?;
+        }
+        if status.is_success() {
+            return Ok(());
+        }
+        match status {
+            StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT => {
+                bail!("E_CONFLICT: {key} changed on the server")
+            }
+            StatusCode::BAD_REQUEST
+                if text.contains("XAmzContentSHA256Mismatch") || text.contains("BadDigest") =>
+            {
+                bail!("E_VERIFY: The server received different bytes than planned")
+            }
+            _ => bail!("Storage request failed with HTTP {}", status.as_u16()),
+        }
     }
 
     fn s3_put_new<R: Read + Send + 'static>(

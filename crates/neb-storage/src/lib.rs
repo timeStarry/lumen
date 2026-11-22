@@ -15,7 +15,7 @@ pub use range_reader::{
     RangeObjectIdentity, RangeReadError, RangeReadOptions, RangeReadStats, RemoteRangeReader,
 };
 pub use remote::{MediaRangeRequest, MediaSlice, MediaStreamResponse};
-pub use remote_write::{RemoteWriter, WriteCapability, WriteCheck};
+pub use remote_write::{RemoteSidecar, RemoteWriter, WriteCapability, WriteCheck};
 pub use snapshot_browser::StorageBrowser;
 
 pub use transport::{inspect_tls, TlsCertificateInfo};
@@ -24,6 +24,18 @@ pub use safe::{
     atomic_json, hash_reader, open_scoped, publish_reader, quick_fingerprint_reader, safe_join,
     validate_key, PreparedDestination, ScopedDestination, ScopedSource,
 };
+
+pub(crate) fn validate_xmp_key(key: &str) -> Result<()> {
+    validate_key(key, false)?;
+    let filename = key.rsplit('/').next().unwrap_or(key);
+    let Some((stem, ext)) = filename.rsplit_once('.') else {
+        bail!("E_INVALID: Sidecar key must end with .xmp");
+    };
+    if stem.is_empty() || !ext.eq_ignore_ascii_case("xmp") {
+        bail!("E_INVALID: Sidecar key must end with .xmp");
+    }
+    Ok(())
+}
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};

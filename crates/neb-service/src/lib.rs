@@ -24,6 +24,7 @@ mod cards;
 mod fingerprint;
 mod remote_cache;
 pub use remote_cache::{ByteRangeSpec, MediaChunk, MediaStream};
+mod remote_xmp;
 
 const PREVIEW_MEMORY_ENTRIES: usize = 1024;
 const PREVIEW_MEMORY_BYTES: usize = 192 * 1024 * 1024;
@@ -133,6 +134,7 @@ pub struct Service {
     catalog_operations: RwLock<()>,
     capture_index: capture_index::CaptureIndexController,
     fingerprints: fingerprint::FingerprintController,
+    remote_xmp: remote_xmp::RemoteXmpSyncer,
 }
 
 /// Bounded memory of computed histograms, oldest dropped first.
@@ -206,7 +208,7 @@ impl Service {
         let deadline = std::time::Instant::now() + timeout;
         let cancelled_jobs = self.cancel_all_capture_index()?;
         loop {
-            let pending_writes = self.pending_preview_writes();
+            let pending_writes = self.pending_preview_writes() + self.remote_xmp.pending_count();
             let jobs_active = self.capture_index_active()?;
             if pending_writes == 0 && !jobs_active {
                 return Ok(QuiesceReport {
@@ -264,6 +266,7 @@ impl Service {
             catalog_operations: RwLock::new(()),
             capture_index: capture_index::CaptureIndexController::default(),
             fingerprints: fingerprint::FingerprintController::default(),
+            remote_xmp: remote_xmp::RemoteXmpSyncer::new(),
         };
         service.sync_locations()?;
         if !service.cache.has_other_sessions().unwrap_or(true) {
@@ -637,12 +640,21 @@ impl Service {
         // Register published files directly from known keys and sizes; no rescan.
         let mut registered = 0;
         let mut errors = Vec::new();
+        let mut copied_xmp: HashMap<String, (String, String)> = HashMap::new();
+        let mut new_assets: Vec<(String, String)> = Vec::new();
         for item in outcome.items.iter().filter(|item| item.status == "copied") {
             let extension = Path::new(&item.destination)
                 .extension()
                 .and_then(|v| v.to_str())
                 .unwrap_or_default()
                 .to_ascii_lowercase();
+            if extension == "xmp" {
+                copied_xmp.insert(
+                    item.destination.to_ascii_lowercase(),
+                    (item.destination.clone(), item.source.clone()),
+                );
+                continue;
+            }
             if neb_core::image_kind(&extension).is_none() {
                 continue;
             }
@@ -653,15 +665,57 @@ impl Service {
                 )),
                 extension
             );
-            match self.core.register_remote_asset(
+            match self.core.register_remote_asset_status(
                 &library.id,
                 &item.destination,
                 &cache_name,
                 item.size,
             ) {
-                Ok(_) => registered += 1,
+                Ok((asset, is_new)) => {
+                    registered += 1;
+                    if is_new {
+                        new_assets.push((asset.id, item.destination.clone()));
+                    }
+                }
                 Err(error) => {
                     errors.push(json!({"path":item.destination,"message":format!("{error:#}")}))
+                }
+            }
+        }
+        if !new_assets.is_empty() && !copied_xmp.is_empty() {
+            let mut parsed_cache: HashMap<String, Option<neb_core::xmp::SidecarData>> =
+                HashMap::new();
+            for (asset_id, dest_key) in new_assets {
+                let Some(candidates) = neb_core::xmp::sidecar_candidates_for_key(&dest_key) else {
+                    continue;
+                };
+                let Some((remote_xmp_key, local_src)) = candidates
+                    .into_iter()
+                    .find_map(|cand| copied_xmp.get(&cand.to_ascii_lowercase()).cloned())
+                else {
+                    continue;
+                };
+                let parsed = parsed_cache
+                    .entry(remote_xmp_key.clone())
+                    .or_insert_with(|| {
+                        let local_bytes = fs::metadata(&local_src)
+                            .ok()
+                            .filter(|m| m.is_file() && m.len() <= neb_core::xmp::MAX_XMP_BYTES)
+                            .and_then(|_| fs::read(&local_src).ok());
+                        let bytes = local_bytes.or_else(|| {
+                            writer
+                                .read_sidecar(&remote_xmp_key, neb_core::xmp::MAX_XMP_BYTES)
+                                .ok()
+                                .flatten()
+                                .map(|s| s.bytes)
+                        })?;
+                        neb_core::xmp::parse_xmp_bytes(&bytes).ok()
+                    })
+                    .clone();
+                if let Some(sidecar) = parsed {
+                    let _ = self
+                        .core
+                        .apply_initial_remote_sidecar(&asset_id, &library.id, sidecar);
                 }
             }
         }
@@ -968,6 +1022,8 @@ impl Service {
         let mut pending = VecDeque::from([library.source_prefix.clone()]);
         let mut seen = HashSet::new();
         let mut keys = Vec::new();
+        let mut xmp_keys: HashMap<String, String> = HashMap::new();
+        let mut new_remote_assets: Vec<(String, String)> = Vec::new();
         let (mut indexed, mut skipped, mut entries_seen, mut pages_seen) =
             (0usize, 0usize, 0usize, 0usize);
         let mut errors = Vec::new();
@@ -989,6 +1045,13 @@ impl Service {
                 let page = match browser.browse(&prefix, 1000, cursor.as_deref()) {
                     Ok(page) => page,
                     Err(error) if indexed > 0 => {
+                        let _ = self.flush_remote_scan_sidecars(
+                            &library,
+                            id,
+                            &browser,
+                            &xmp_keys,
+                            &mut new_remote_assets,
+                        );
                         errors.push(json!({"path":prefix,"message":format!("{error:#}")}));
                         return Ok(
                             json!({"indexed":indexed,"skipped":skipped,"errors":errors,"partial":true,"source_kind":source.kind,"cached_on_demand":true}),
@@ -1019,6 +1082,11 @@ impl Service {
                             .and_then(|v| v.to_str())
                             .unwrap_or_default()
                             .to_ascii_lowercase();
+                        if extension == "xmp" {
+                            xmp_keys.insert(entry.key.to_ascii_lowercase(), entry.key);
+                            skipped += 1;
+                            continue;
+                        }
                         if neb_core::image_kind(&extension).is_none() {
                             skipped += 1;
                             continue;
@@ -1032,16 +1100,19 @@ impl Service {
                         );
                         match self
                             .core
-                            .register_remote_asset(id, &entry.key, &cache_name, entry.size)
-                            .and_then(|asset| {
+                            .register_remote_asset_status(id, &entry.key, &cache_name, entry.size)
+                            .and_then(|(asset, is_new)| {
                                 self.core.set_remote_created_at(
                                     &asset.id,
                                     entry.created_at.as_deref(),
                                 )?;
-                                Ok(asset)
+                                Ok((asset, is_new))
                             }) {
-                            Ok(_) => {
+                            Ok((asset, is_new)) => {
                                 indexed += 1;
+                                if is_new {
+                                    new_remote_assets.push((asset.id, entry.key.clone()));
+                                }
                                 keys.push(entry.key);
                             }
                             Err(error) => errors
@@ -1058,6 +1129,14 @@ impl Service {
                 );
                 cursor = Some(next);
             }
+            self.flush_remote_scan_sidecars(
+                &library,
+                id,
+                &browser,
+                &xmp_keys,
+                &mut new_remote_assets,
+            )?;
+            xmp_keys.clear();
         }
         if errors.is_empty() {
             let _library = process_library_lock(&self.data_dir, id, true)?;
@@ -1069,15 +1148,75 @@ impl Service {
         )
     }
 
+    fn flush_remote_scan_sidecars(
+        &self,
+        library: &Library,
+        id: &str,
+        browser: &neb_storage::StorageBrowser,
+        xmp_keys: &HashMap<String, String>,
+        new_remote_assets: &mut Vec<(String, String)>,
+    ) -> Result<()> {
+        if new_remote_assets.is_empty() {
+            return Ok(());
+        }
+        let batch = std::mem::take(new_remote_assets);
+        if xmp_keys.is_empty() {
+            return Ok(());
+        }
+        let mut parsed_cache: HashMap<String, Option<neb_core::xmp::SidecarData>> = HashMap::new();
+        for (asset_id, source_key) in batch {
+            let Some(candidates) = neb_core::xmp::sidecar_candidates_for_key(&source_key) else {
+                continue;
+            };
+            let Some(sidecar_key) = candidates
+                .into_iter()
+                .find_map(|cand| xmp_keys.get(&cand.to_ascii_lowercase()).cloned())
+            else {
+                continue;
+            };
+            let parsed = parsed_cache
+                .entry(sidecar_key.clone())
+                .or_insert_with(|| {
+                    let bytes = (0..2).find_map(|_| {
+                        browser
+                            .read_sidecar(&sidecar_key, neb_core::xmp::MAX_XMP_BYTES)
+                            .ok()
+                            .flatten()
+                    })?;
+                    neb_core::xmp::parse_xmp_bytes(&bytes).ok()
+                })
+                .clone();
+            if let Some(sidecar) = parsed {
+                let _library = process_library_lock(&self.data_dir, id, true)?;
+                self.check_scan_binding(library)?;
+                let _ = self
+                    .core
+                    .apply_initial_remote_sidecar(&asset_id, id, sidecar);
+            }
+        }
+        Ok(())
+    }
+
     fn dispatch(&self, command: &str, params: Value) -> Result<Value> {
+        if command == "asset.xmp.write" {
+            return self.write_xmp_sidecars(params);
+        }
+        if command == "asset.xmp.read" {
+            return self.read_xmp_sidecars(params);
+        }
+        if matches!(command, "asset.mark_batch" | "asset.keywords.set") {
+            let ids: Vec<String> = params
+                .get("ids")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let value = self.core.dispatch(command, params)?;
+            self.enqueue_remote_xmp_if_enabled(&ids, command == "asset.keywords.set");
+            return Ok(value);
+        }
         if matches!(
             command,
-            "asset.mark_batch"
-                | "asset.keywords.set"
-                | "asset.trash"
+            "asset.trash"
                 | "asset.restore"
-                | "asset.xmp.write"
-                | "asset.xmp.read"
                 | "xmp.policy.get"
                 | "xmp.policy.set"
                 | "collection.list"

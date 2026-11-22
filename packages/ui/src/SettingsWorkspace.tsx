@@ -153,7 +153,7 @@ function CullingSettings() {
       />
       <ListRow
         title="自动同步 .xmp 伴随文件"
-        description="修改本地照片的星级、旗标或裁剪时自动无损更新同名 .xmp（完整保留 Lightroom / Camera Raw 原有显影参数，绝不改动原片）。"
+        description="修改本地或远端存储（WebDAV / S3）照片的星级、旗标或裁剪时自动无损更新同名 .xmp（完整保留 Lightroom / Camera Raw 原有显影参数，绝不改动原片）。"
         control={
           <Switch
             label="自动同步 .xmp 伴随文件"
