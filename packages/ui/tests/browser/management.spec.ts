@@ -85,6 +85,13 @@ async function fixture(page: Page, handler?: (call: Call) => unknown | Promise<u
               error: null,
             };
             break;
+          case 'storage.write_check':
+            result = {
+              id: String(call.params.id),
+              write_capability: 'verified',
+              checked_at: '2026-11-13T00:00:00Z',
+            };
+            break;
           case 'system.info':
             result = { originals_read_only: true };
             break;
@@ -1051,8 +1058,16 @@ test('an offline NAS library is greyed, explains why, keeps marks usable and blo
   // Browsing the existing index still works while the location is offline.
   await expect(page.getByRole('button', { name: /Mountain\.png/ })).toBeVisible();
   expect(calls.some((call) => call.command === 'library.scan')).toBe(false);
+  const checkCountBefore = calls.filter((call) => call.command === 'storage.check').length;
   await banner.getByRole('button', { name: '检查连接' }).click();
-  await expect(page.getByRole('heading', { name: '位置' })).toBeVisible();
+  await expect
+    .poll(() => calls.filter((call) => call.command === 'storage.check').length)
+    .toBeGreaterThan(checkCountBefore);
+  await expect(
+    page.locator('.nl-page-header:visible').getByRole('heading', { name: 'NAS 旅行' }),
+  ).toBeVisible();
+  await banner.getByRole('button', { name: '连接设置' }).click();
+  await expect(page.getByRole('dialog')).toBeVisible();
 });
 
 test('a registered card applies its default preset, and import leads straight into culling the batch', async ({
@@ -1187,7 +1202,7 @@ test('a registered card applies its default preset, and import leads straight in
   await expect(page.getByLabel('导入批次')).toHaveAttribute('data-value', 'batch-1');
 });
 
-test('a NAS import is planned by library id and blocked until the location passes a write test', async ({
+test('a NAS import automatically verifies write capability in place without jumping to Locations', async ({
   page,
 }) => {
   let capability = 'unverified';
@@ -1195,7 +1210,7 @@ test('a NAS import is planned by library id and blocked until the location passe
     if (call.command === 'storage.list') return [{ ...nas, write_capability: capability }];
     if (call.command === 'storage.write_check') {
       capability = 'verified';
-      return { id: nas.id, write_capability: 'verified', checked_at: '2026-10-23' };
+      return { id: nas.id, prefix: 'trips', write_capability: 'verified', checked_at: '2026-10-23' };
     }
     if (call.command === 'import.plan')
       return {
@@ -1240,6 +1255,13 @@ test('a NAS import is planned by library id and blocked until the location passe
   });
   await nav(page, '导入').click();
   await selectChoice(page.getByLabel('目标图片库'), remote.id);
+  await expect
+    .poll(() => calls.find((call) => call.command === 'storage.write_check')?.params)
+    .toMatchObject({ id: nas.id, library_id: remote.id });
+  await expect(
+    page.getByRole('region', { name: '导入到' }).getByText('可写入', { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole('button', { name: '去测试写入' })).toHaveCount(0);
   await page.getByRole('button', { name: /CAMERA CARD/ }).click();
   await page.getByRole('button', { name: '生成导入计划' }).click();
   await expect
@@ -1249,17 +1271,7 @@ test('a NAS import is planned by library id and blocked until the location passe
   await expect(
     page.getByRole('table', { name: '导入文件' }).getByText('疑似重复', { exact: true }),
   ).toBeVisible();
-  await expect(page.getByText(/需要先在“位置”中对这个网络位置“测试写入”/)).toBeVisible();
-  await page.getByRole('checkbox', { name: '我已核对来源、目标和导入计划' }).check();
-  await expect(page.getByRole('button', { name: '开始导入' })).toBeDisabled();
-  await page.getByRole('button', { name: '前往位置' }).click();
-  await page.getByRole('button', { name: '测试写入' }).click();
-  await expect(page.getByRole('button', { name: '可导入' })).toBeVisible();
-  expect(calls.some((call) => call.command === 'storage.write_check')).toBe(true);
-  await nav(page, '导入').click();
-  await page.getByRole('button', { name: '返回修改' }).click();
-  await selectChoice(page.getByLabel('目标图片库'), remote.id);
-  await page.getByRole('button', { name: '生成导入计划' }).click();
+  await expect(page.getByRole('button', { name: '前往位置' })).toHaveCount(0);
   await page.getByRole('checkbox', { name: /仍然导入疑似重复项/ }).check();
   await page.getByRole('checkbox', { name: '我已核对来源、目标和导入计划' }).check();
   await page.getByRole('button', { name: '开始导入' }).click();
@@ -1403,19 +1415,30 @@ test('the setup aside summarises the route and shows where files will land', asy
   await expect(aside.locator('.organize-example')).toContainText('DSC_0001.NEF');
 });
 
-test('an unverified network target keeps 开始导入 disabled and says why in the aside', async ({
+test('a read-only or failing network target keeps 开始导入 disabled and refreshes in place', async ({
   page,
 }) => {
+  let writable = false;
   await fixture(page, (call) => {
+    if (call.command === 'storage.write_check')
+      return writable
+        ? { id: nas.id, write_capability: 'verified', checked_at: '2026-10-23' }
+        : {
+            id: nas.id,
+            write_capability: 'unverified',
+            error: 'Storage request failed with HTTP 403',
+            checked_at: '2026-10-23',
+          };
     if (call.command === 'import.plan')
       return {
         id: 'nas-plan',
         source: call.params.source,
         destination: '',
+        library_id: remote.id,
         duplicate_count: 0,
         total_bytes: 10,
         warnings: [],
-        write_capability: 'unverified',
+        write_capability: writable ? 'verified' : 'unverified',
         items: [{ source: 'E:\\a.png', relative_path: 'a.png', size: 10, status: 'pending' }],
       };
     return undefined;
@@ -1425,9 +1448,58 @@ test('an unverified network target keeps 开始导入 disabled and says why in t
   await page.getByRole('button', { name: /CAMERA CARD/ }).click();
   await page.getByRole('button', { name: '生成导入计划' }).click();
   const aside = page.getByRole('complementary', { name: '导入计划摘要' });
-  await expect(aside).toContainText('需要先');
+  await expect(aside).toContainText('HTTP 403');
   await page.getByRole('checkbox', { name: '我已核对来源、目标和导入计划' }).check();
   await expect(aside.getByRole('button', { name: '开始导入' })).toBeDisabled();
+  writable = true;
+  await aside.getByRole('button', { name: '重新检测' }).click();
+  await expect(aside.getByRole('button', { name: '开始导入' })).toBeEnabled();
+});
+
+test('batch dock renders numberless star icons and never clips trash or clear buttons across viewports', async ({
+  page,
+}) => {
+  await fixture(page, (call) => {
+    if (call.command === 'asset.list')
+      return {
+        items: [
+          { ...photo, id: 'p-1', filename: 'A.png', library_id: local.id },
+          { ...photo, id: 'p-2', filename: 'B.png', library_id: local.id },
+        ],
+        total: 2,
+      };
+    if (call.command === 'asset.ids') return { ids: ['p-1', 'p-2'], total: 2 };
+    return undefined;
+  });
+  await page.getByRole('button', { name: '打开图片库 本地摄影' }).click();
+  const cells = page.locator('.thumbnail');
+  await expect(cells).toHaveCount(2);
+  await cells.first().click();
+  await page.keyboard.press('ControlOrMeta+a');
+  const dock = page.getByRole('toolbar', { name: '批量操作' });
+  await expect(dock).toBeVisible();
+  const ratingGroup = dock.getByRole('group', { name: '批量评级' });
+  for (const value of [1, 2, 3, 4, 5]) {
+    const starBtn = ratingGroup.getByRole('button', { name: `将所选照片评为 ${value} 星` });
+    await expect(starBtn).toBeVisible();
+    expect((await starBtn.textContent())?.trim()).toBe('');
+  }
+  for (const width of [1440, 1280, 1024, 720]) {
+    await page.setViewportSize({ width, height: 760 });
+    const bounds = await dock.evaluate((el) => {
+      const bar = el.getBoundingClientRect();
+      const trash = [...el.querySelectorAll('button')].find((b) =>
+        b.textContent?.includes('移到废纸篓'),
+      )!.getBoundingClientRect();
+      const clear = el
+        .querySelector('button[aria-label="取消选择"]')!
+        .getBoundingClientRect();
+      return { bar, trash, clear };
+    });
+    expect(bounds.trash.left).toBeGreaterThanOrEqual(bounds.bar.left - 0.5);
+    expect(bounds.trash.right).toBeLessThanOrEqual(bounds.bar.right + 0.5);
+    expect(bounds.clear.right).toBeLessThanOrEqual(bounds.bar.right + 0.5);
+  }
 });
 
 test('settings sections switch with a segmented control and keep their content', async ({

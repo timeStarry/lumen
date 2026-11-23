@@ -10,6 +10,8 @@ export interface Library {
   source_endpoint?: string;
   connected?: boolean;
   availability?: Availability;
+  /** Per-library write capability for remote targets, scoped to `source_prefix`. */
+  write_capability?: WriteCapability;
   hidden?: boolean;
   pair_raw_jpeg?: boolean;
   /** From library.list: photos in the index that are not missing. */
@@ -287,6 +289,7 @@ export interface StorageConfig {
 export type WriteCapability = 'unverified' | 'verified' | 'unsupported';
 export interface WriteCheck {
   id: string;
+  prefix?: string;
   write_capability: WriteCapability;
   error?: string | null;
   leftover?: string | null;

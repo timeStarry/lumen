@@ -454,5 +454,153 @@ fn remote_sidecar_read_and_write_enforce_xmp_safety_on_webdav_and_s3() {
             "online",
             "sidecar write 403 must not poison read availability to auth_required ({kind})"
         );
+        let probe = ro_writer.probe_at("album");
+        assert_eq!(probe.write_capability, "unverified");
+        assert_eq!(
+            ro_reg.list()[0].availability,
+            "online",
+            "probe 403 must not poison read availability to auth_required ({kind})"
+        );
     }
+}
+
+#[test]
+fn probe_at_prefix_handles_nas_virtual_root_and_existing_shared_folder() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let store: Store = Arc::default();
+    let shared = store.clone();
+    thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let store = shared.clone();
+            thread::spawn(move || {
+                let mut data = Vec::new();
+                let mut buffer = [0u8; 8192];
+                let header_end = loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => data.extend_from_slice(&buffer[..n]),
+                    }
+                    if let Some(idx) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break idx + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&data[..header_end]).to_string();
+                let mut lines = head.lines();
+                let mut req = lines.next().unwrap().split(' ');
+                let method = req.next().unwrap().to_owned();
+                let path = req.next().unwrap().to_owned();
+                let headers: HashMap<String, String> = lines
+                    .filter_map(|l| l.split_once(':'))
+                    .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_owned()))
+                    .collect();
+                let len: usize = headers
+                    .get("content-length")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let mut body = data[header_end..].to_vec();
+                while body.len() < len {
+                    let n = stream.read(&mut buffer).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&buffer[..n]);
+                }
+                let mut files = store.lock().unwrap();
+                // Virtual root `/` forbids direct PUT/MKCOL; `/Z30` is an existing shared folder
+                // that forbids `MKCOL /Z30` (403) while answering `PROPFIND /Z30/` (207) and allowing
+                // nested folders & files inside `/Z30/...`.
+                let in_z30 = path.starts_with("/Z30/");
+                let status = match method.as_str() {
+                    "PROPFIND" if path == "/Z30/" || path == "/Z30" => "207 Multi-Status",
+                    "PROPFIND" => "404 Not Found",
+                    "MKCOL" if path == "/Z30" || path == "/Z30/" => "403 Forbidden",
+                    "MKCOL" if in_z30 => "201 Created",
+                    "MKCOL" => "403 Forbidden",
+                    "PUT" if !in_z30 => "403 Forbidden",
+                    "PUT" if files.contains_key(&path) => "412 Precondition Failed",
+                    "PUT" => {
+                        files.insert(path, body);
+                        "201 Created"
+                    }
+                    "MOVE" if in_z30 => {
+                        let dest = headers["destination"]
+                            .splitn(4, '/')
+                            .nth(3)
+                            .map(|p| format!("/{p}"))
+                            .unwrap();
+                        if files.contains_key(&dest) {
+                            "412 Precondition Failed"
+                        } else {
+                            let bytes = files.remove(&path).unwrap_or_default();
+                            files.insert(dest, bytes);
+                            "201 Created"
+                        }
+                    }
+                    "DELETE" if in_z30 => {
+                        files.remove(&path);
+                        "204 No Content"
+                    }
+                    _ => "403 Forbidden",
+                };
+                drop(files);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            });
+        }
+    });
+
+    let data = tempfile::tempdir().unwrap();
+    let mut reg = StorageRegistry::open(data.path()).unwrap();
+    let id = reg
+        .add(
+            serde_json::from_value(serde_json::json!({
+                "name": "Synology",
+                "kind": "webdav",
+                "endpoint": format!("http://127.0.0.1:{port}"),
+                "username": "u",
+                "password": "p",
+                "remember_credentials": false
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+        .id;
+
+    let writer = reg.open_writer(&id).unwrap();
+    // Root `/` is virtual and rejects writes with 403.
+    let root_probe = writer.probe();
+    assert_eq!(root_probe.write_capability, "unverified");
+    assert_eq!(
+        reg.write_capability_at(&id, "Z30"),
+        WriteCapability::Unverified
+    );
+
+    // Scoped probe inside `/Z30` succeeds and cleans up its test file.
+    let z30_probe = writer.probe_at("Z30");
+    assert_eq!(
+        z30_probe.write_capability, "verified",
+        "{:?}",
+        z30_probe.error
+    );
+    assert_eq!(z30_probe.prefix, "Z30");
+    assert_eq!(
+        reg.write_capability_at(&id, "Z30"),
+        WriteCapability::Verified
+    );
+    assert_eq!(reg.write_capability(&id), WriteCapability::Verified);
+    // Another unprobed sibling share remains Unverified until checked.
+    assert_eq!(
+        reg.write_capability_at(&id, "other_share"),
+        WriteCapability::Unverified
+    );
+
+    // Publishing nested paths under Z30 tolerates 403 on MKCOL /Z30 via PROPFIND Depth: 0.
+    put(&writer, "Z30/2026/10/DSC_0001.NEF", b"nef-bytes").unwrap();
+    assert_eq!(
+        store.lock().unwrap()["/Z30/2026/10/DSC_0001.NEF"],
+        b"nef-bytes"
+    );
 }

@@ -196,7 +196,7 @@ describe('location availability presentation', () => {
     expect(offline.detail).toContain('评级与旗标仍可修改');
     expect(availabilityPresentation({ ...base, availability: 'auth_required' }).action).toEqual({
       label: '重新登录',
-      section: 'sources',
+      kind: 'reconnect',
     });
     expect(availabilityPresentation({ ...base, availability: 'trust_required' }).label).toBe(
       '证书待确认',

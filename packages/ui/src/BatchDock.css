@@ -1,4 +1,5 @@
 .batch-dock-count {
+  flex: none;
   padding-left: var(--nl-s-1);
   color: var(--nl-text);
   font-size: var(--nl-t-13);
@@ -12,15 +13,56 @@
   background: var(--nl-line);
 }
 .batch-dock .library-batch-group {
+  flex: none;
   display: inline-flex;
   align-items: center;
   gap: 2px;
 }
+.batch-dock .batch-action-tail {
+  gap: var(--nl-s-1);
+}
+.batch-dock .batch-compact-btn {
+  flex: none;
+  padding: 0 var(--nl-s-2);
+}
+.batch-star-btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--nl-h-xs);
+  height: var(--nl-h-sm);
+  padding: 0;
+  border: 0;
+  border-radius: var(--nl-r-xs);
+  background: transparent;
+  color: var(--nl-text-2);
+  cursor: pointer;
+  transition:
+    background var(--nl-d-fast) var(--nl-ease),
+    color var(--nl-d-fast) var(--nl-ease);
+}
+.batch-star-btn:hover,
+.batch-star-btn:focus-visible {
+  background: var(--nl-hover);
+  color: var(--nl-warn);
+}
+.batch-star-btn:focus-visible {
+  outline: 2px solid var(--nl-ring);
+  outline-offset: -2px;
+}
+.batch-star-btn.filled {
+  color: var(--nl-warn);
+}
+.batch-star-btn.filled svg {
+  fill: currentColor;
+}
 .batch-color-btn {
+  flex: none;
   display: inline-grid;
   place-items: center;
-  width: 24px;
-  height: 24px;
+  width: var(--nl-h-xs);
+  height: var(--nl-h-xs);
   padding: 0;
   border: 1px solid transparent;
   border-radius: var(--nl-r-pill);

@@ -137,6 +137,7 @@ import {
   type StorageCheck,
   type StorageConfig,
   type TrashResult,
+  type WriteCheck,
   type XmpSyncReport,
 } from './model';
 import {
@@ -1279,6 +1280,57 @@ export default function ManagementApp() {
     }
   }
 
+  function reconnectLibrarySource(library: Library) {
+    if (!library.storage_id || !library.source_kind || library.source_kind === 'local') return;
+    const target =
+      sources().find((item) => item.id === library.storage_id) ??
+      ({
+        id: library.storage_id,
+        name: library.source_name || library.name,
+        kind: library.source_kind,
+        endpoint: library.source_endpoint || '',
+      } as StorageConfig);
+    editSource(target);
+  }
+
+  function handleWriteChecked(library: Library, check: WriteCheck) {
+    setLibraries((previous) =>
+      previous.map((item) =>
+        item.id === library.id ? { ...item, write_capability: check.write_capability } : item,
+      ),
+    );
+    if (library.storage_id) {
+      setSources((previous) =>
+        previous.map((item) =>
+          item.id === library.storage_id
+            ? {
+                ...item,
+                ...(check.write_capability === 'unsupported' ||
+                (check.write_capability === 'verified' &&
+                  (!item.write_capability || item.write_capability === 'unverified'))
+                  ? { write_capability: check.write_capability }
+                  : {}),
+              }
+            : item,
+        ),
+      );
+    }
+  }
+
+  const sharedSelectionRating = createMemo(() => {
+    const ids = selectedIds();
+    if (ids.length < 2) return 0;
+    const byId = new Map(assets().map((item) => [item.id, item.rating]));
+    let common: number | undefined;
+    for (let i = 0; i < Math.min(ids.length, 200); i++) {
+      const r = byId.get(ids[i]);
+      if (r === undefined) continue;
+      if (common === undefined) common = r;
+      else if (common !== r) return 0;
+    }
+    return common || 0;
+  });
+
   async function retryLibraryConnection(library: Library) {
     if (library.storage_id && library.source_kind && library.source_kind !== 'local') {
       const target =
@@ -2374,6 +2426,17 @@ export default function ManagementApp() {
         disabled: scanningThis || !!busy(),
         onSelect: () => editLibrary(library),
       },
+      ...(desktop && library.source_kind && library.source_kind !== 'local' && library.storage_id
+        ? ([
+            {
+              label: '连接设置…',
+              ariaLabel: `${library.name} 连接设置`,
+              icon: 'cloud',
+              disabled: scanningThis || !!busy(),
+              onSelect: () => reconnectLibrarySource(library),
+            },
+          ] as MenuEntry[])
+        : []),
       ...(desktop
         ? ([
             {
@@ -2723,6 +2786,8 @@ export default function ManagementApp() {
             extraActions={<TaskPill tasks={tasks} />}
             onOpen={(library) => enterLibrary(library)}
             onRelocate={(library) => void relocateLibrary(library)}
+            onRetryConnection={(library) => void retryLibraryConnection(library)}
+            onReconnectSource={reconnectLibrarySource}
             onCreate={() => {
               if (desktop) newLibrary();
               else {
@@ -2864,29 +2929,60 @@ export default function ManagementApp() {
                             <Button size="sm" onClick={() => void relocateLibrary(library())}>
                               重新定位目录…
                             </Button>
-                          </Show>
-                          <Show when={availabilityPresentation(library()).action}>
-                            {(fix) => (
-                              <Button size="sm" onClick={() => navigate(fix().section)}>
-                                {fix().label}
-                              </Button>
-                            )}
-                          </Show>
-                          <Show when={desktop}>
                             <Button
                               size="sm"
                               variant="ghost"
-                              disabled={
-                                !!library().storage_id &&
-                                checkingSourceIds().has(library().storage_id!)
-                              }
                               onClick={() => void retryLibraryConnection(library())}
                             >
-                              {library().storage_id &&
-                              checkingSourceIds().has(library().storage_id!)
-                                ? '正在重试…'
-                                : '重试'}
+                              重试
                             </Button>
+                          </Show>
+                          <Show when={desktop && availabilityPresentation(library()).action}>
+                            {(fix) => {
+                              const checkingThis = () =>
+                                !!library().storage_id &&
+                                checkingSourceIds().has(library().storage_id!);
+                              return (
+                                <>
+                                  <Show
+                                    when={fix().kind === 'reconnect'}
+                                    fallback={
+                                      <>
+                                        <Button
+                                          size="sm"
+                                          disabled={checkingThis()}
+                                          onClick={() => void retryLibraryConnection(library())}
+                                        >
+                                          {checkingThis() ? '正在检查…' : fix().label}
+                                        </Button>
+                                        <Button
+                                          size="sm"
+                                          variant="ghost"
+                                          onClick={() => reconnectLibrarySource(library())}
+                                        >
+                                          连接设置
+                                        </Button>
+                                      </>
+                                    }
+                                  >
+                                    <Button
+                                      size="sm"
+                                      onClick={() => reconnectLibrarySource(library())}
+                                    >
+                                      {fix().label}
+                                    </Button>
+                                    <Button
+                                      size="sm"
+                                      variant="ghost"
+                                      disabled={checkingThis()}
+                                      onClick={() => void retryLibraryConnection(library())}
+                                    >
+                                      {checkingThis() ? '正在重试…' : '重试'}
+                                    </Button>
+                                  </Show>
+                                </>
+                              );
+                            }}
                           </Show>
                         </>
                       }
@@ -3363,6 +3459,7 @@ export default function ManagementApp() {
                   </Show>
                   <BatchDock
                     count={selectedIds().length}
+                    sharedRating={sharedSelectionRating()}
                     canTrash={library().source_kind === 'local' || !library().source_kind}
                     exportBusy={tasks.isRunning('export')}
                     trashBusy={!!busy()}
@@ -3385,6 +3482,7 @@ export default function ManagementApp() {
         </Show>
         <div class="persistent-workspace" hidden={section() !== 'sources'}>
           <StorageWorkspace
+            active={section() === 'sources'}
             sources={sources()}
             checkingIds={checkingSourceIds()}
             removableLibraries={removableLibraries()}
@@ -3404,8 +3502,10 @@ export default function ManagementApp() {
             onCreateLibrary={() => newLibrary()}
             onOpenLibrary={enterLibrary}
             onCull={(library, batch) => void cullBatch(library, batch)}
-            onOpenLocations={() => navigate('sources')}
             sources={sources()}
+            onWriteChecked={handleWriteChecked}
+            onRetryConnection={retryLibraryConnection}
+            onReconnectSource={reconnectLibrarySource}
             onImported={() => {
               void refreshLibraries();
               if (libraryId()) void loadAssets();
@@ -3485,12 +3585,20 @@ export default function ManagementApp() {
           existing={editingSource()}
           onClose={() => setDialog(null)}
           onAdded={(source, verified) => {
+            const wasEditing = !!editingSource();
             updateSource(
               verified ? { ...source, connected: true, availability: 'online' } : source,
             );
-            void checkRemoteSources([source], true);
+            void checkRemoteSources([source], true).then(() => {
+              void refreshLibraries();
+              if (section() === 'libraries' && currentLibrary()?.storage_id === source.id) {
+                void loadAssets(false, true);
+              }
+            });
             setDialog(null);
-            setSection('sources');
+            if (!wasEditing && section() !== 'libraries' && section() !== 'cards') {
+              setSection('sources');
+            }
             setNotice(
               verified
                 ? `已保存并连接 ${source.name}。`

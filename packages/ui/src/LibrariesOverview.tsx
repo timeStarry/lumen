@@ -24,6 +24,8 @@ export default function LibrariesOverview(props: {
   onOpen: (library: Library) => void;
   onCreate: () => void;
   onRelocate?: (library: Library) => void;
+  onRetryConnection?: (library: Library) => void;
+  onReconnectSource?: (library: Library) => void;
   libraryMenu: (library: Library) => MenuEntry[];
 }) {
   const summary = createMemo(() => summarizeLibraries(props.libraries));
@@ -167,6 +169,34 @@ export default function LibrariesOverview(props: {
                         >
                           <Icon name="usb" size={13} />
                           <span>已检测到卷挂载</span>
+                        </button>
+                      </div>
+                    </Show>
+                    <Show
+                      when={
+                        props.desktop &&
+                        library.source_kind &&
+                        library.source_kind !== 'local' &&
+                        !state().usable &&
+                        state().action
+                      }
+                    >
+                      <div class="library-tile-foot">
+                        <button
+                          type="button"
+                          class="library-tile-relocate"
+                          disabled={isChecking()}
+                          onClick={() => {
+                            if (state().action?.kind === 'reconnect')
+                              props.onReconnectSource?.(library);
+                            else props.onRetryConnection?.(library);
+                          }}
+                        >
+                          <Icon
+                            name={state().action?.kind === 'reconnect' ? 'settings' : 'refresh'}
+                            size={13}
+                          />
+                          <span>{isChecking() ? '正在检测…' : state().action!.label}</span>
                         </button>
                       </div>
                     </Show>

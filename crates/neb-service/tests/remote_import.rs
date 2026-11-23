@@ -13,7 +13,7 @@ use std::{
 
 type Store = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 
-fn serve() -> (String, Store) {
+fn serve_with_mode(allow_overwrite: bool, forbid_root_write: bool) -> (String, Store) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let store: Store = Arc::default();
@@ -21,13 +21,13 @@ fn serve() -> (String, Store) {
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let store = shared.clone();
-            thread::spawn(move || handle(stream, &store));
+            thread::spawn(move || handle(stream, &store, allow_overwrite, forbid_root_write));
         }
     });
     (format!("http://127.0.0.1:{port}/dav/"), store)
 }
 
-fn handle(mut stream: TcpStream, store: &Store) {
+fn handle(mut stream: TcpStream, store: &Store, allow_overwrite: bool, forbid_root_write: bool) {
     let mut data = Vec::new();
     let mut buffer = [0u8; 8192];
     let end = loop {
@@ -60,8 +60,12 @@ fn handle(mut stream: TcpStream, store: &Store) {
         }
         body.extend_from_slice(&buffer[..n]);
     }
+    let in_photos = path.starts_with("/dav/photos/");
     let mut files = store.lock().unwrap();
     let (status, reply): (&str, Vec<u8>) = match method.as_str() {
+        "PROPFIND" if path == "/dav/photos/" || path == "/dav/photos" => {
+            ("207 Multi-Status", vec![])
+        }
         "HEAD" => (
             if files.contains_key(&path) {
                 "200 OK"
@@ -78,8 +82,12 @@ fn handle(mut stream: TcpStream, store: &Store) {
             files.remove(&path);
             ("204 No Content", vec![])
         }
+        "MKCOL" if forbid_root_write && !in_photos => ("403 Forbidden", vec![]),
         "MKCOL" => ("201 Created", vec![]),
-        "PUT" if files.contains_key(&path) => ("412 Precondition Failed", vec![]),
+        "PUT" if forbid_root_write && !in_photos => ("403 Forbidden", vec![]),
+        "PUT" if !allow_overwrite && files.contains_key(&path) => {
+            ("412 Precondition Failed", vec![])
+        }
         "PUT" => {
             files.insert(path, body);
             ("201 Created", vec![])
@@ -90,7 +98,7 @@ fn handle(mut stream: TcpStream, store: &Store) {
                 .nth(3)
                 .map(|p| format!("/{p}"))
                 .unwrap();
-            if files.contains_key(&destination) {
+            if !allow_overwrite && files.contains_key(&destination) {
                 ("412 Precondition Failed", vec![])
             } else {
                 let bytes = files.remove(&path).unwrap_or_default();
@@ -110,8 +118,8 @@ fn handle(mut stream: TcpStream, store: &Store) {
 }
 
 #[test]
-fn card_imports_into_a_nas_library_only_after_a_write_test() {
-    let (endpoint, store) = serve();
+fn card_imports_into_a_nas_library_auto_verifying_prefix_write_safety() {
+    let (endpoint, store) = serve_with_mode(false, true);
     let data = tempfile::tempdir().unwrap();
     let card = tempfile::tempdir().unwrap();
     fs::create_dir_all(card.path().join("DCIM/100")).unwrap();
@@ -140,20 +148,8 @@ fn card_imports_into_a_nas_library_only_after_a_write_test() {
         .unwrap();
     assert_eq!(plan["write_capability"], "unverified");
     assert!(store.lock().unwrap().is_empty(), "planning never writes");
-    // Without an explicit write test the import is refused and nothing is written.
-    let refused = svc
-        .execute(
-            "import.execute",
-            json!({"plan_id":plan["id"],"library_id":library["id"]}),
-        )
-        .unwrap_err();
-    assert_eq!(refused.code, "E_WRITE_UNVERIFIED");
-    assert!(store.lock().unwrap().is_empty());
-    let check = svc
-        .execute("storage.write_check", json!({"id":source["id"]}))
-        .unwrap();
-    assert_eq!(check["write_capability"], "verified", "{check}");
-    assert!(store.lock().unwrap().is_empty(), "test object removed");
+    // Executing automatically verifies safe no-overwrite inside `photos/` without
+    // requiring a separate manual jump to Locations, even when root `/dav/` is read-only.
     let result = svc
         .execute(
             "import.execute",
@@ -164,7 +160,10 @@ fn card_imports_into_a_nas_library_only_after_a_write_test() {
     assert_eq!(result["indexing"]["indexed"], 1);
     let day = plan["import_day"].as_str().unwrap();
     let key = format!("photos/Z8/{day}/a.jpg");
+    assert_eq!(store.lock().unwrap().len(), 1, "test object removed");
     assert_eq!(store.lock().unwrap()[&format!("/dav/{key}")], b"jpeg bytes");
+    let libraries = svc.execute("library.list", json!({})).unwrap();
+    assert_eq!(libraries[0]["write_capability"], "verified");
     // The library lists the published photo at its location key, tagged by batch.
     let assets = svc
         .execute(
@@ -183,8 +182,47 @@ fn card_imports_into_a_nas_library_only_after_a_write_test() {
         )
         .unwrap();
     assert_eq!(again["duplicate_count"], 1);
+    assert_eq!(again["write_capability"], "verified");
     assert!(
         card.path().join("DCIM/100/a.jpg").exists(),
         "card originals retained"
+    );
+}
+
+#[test]
+fn nas_import_refuses_unsafe_overwriting_server_before_uploading_any_photo() {
+    let (endpoint, store) = serve_with_mode(true, false);
+    let data = tempfile::tempdir().unwrap();
+    let card = tempfile::tempdir().unwrap();
+    fs::write(card.path().join("a.jpg"), b"jpeg bytes").unwrap();
+    let svc = Service::open(data.path()).unwrap();
+    let source = svc
+        .execute(
+            "storage.add",
+            json!({"name":"Unsafe NAS","kind":"webdav","endpoint":endpoint,"username":"u","password":"p","remember_credentials":false}),
+        )
+        .unwrap();
+    let library = svc
+        .execute(
+            "library.add",
+            json!({"name":"Unsafe 照片","storage_id":source["id"],"prefix":"photos"}),
+        )
+        .unwrap();
+    let plan = svc
+        .execute(
+            "import.plan",
+            json!({"source":card.path(),"library_id":library["id"],"rules":{"date_basis":"none"}}),
+        )
+        .unwrap();
+    let refused = svc
+        .execute(
+            "import.execute",
+            json!({"plan_id":plan["id"],"library_id":library["id"]}),
+        )
+        .unwrap_err();
+    assert_eq!(refused.code, "E_UNSUPPORTED");
+    assert!(
+        store.lock().unwrap().is_empty(),
+        "probe object must be cleaned up and zero user photos uploaded"
     );
 }

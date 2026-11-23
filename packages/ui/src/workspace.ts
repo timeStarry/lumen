@@ -227,8 +227,8 @@ export interface AvailabilityPresentation {
   usable: boolean;
   label: string;
   detail: string;
-  /** Section that resolves the problem, when one exists. */
-  action?: { label: string; section: WorkspaceSection };
+  /** In-place remediation kind when one exists, avoiding workspace page jumps. */
+  action?: { label: string; kind: 'retry' | 'reconnect' };
 }
 /** One source of truth for location state across cards, grid and dialogs. */
 export function availabilityPresentation(
@@ -253,28 +253,28 @@ export function availabilityPresentation(
         detail: local
           ? `${where} 当前不可用，可能是外接盘未插入。评级与旗标仍可修改，有缓存的照片仍可查看。`
           : `${where} 当前无法连接。评级与旗标仍可修改，已缓存或固定离线的照片仍可查看。`,
-        action: local ? undefined : { label: '检查连接', section: 'sources' },
+        action: local ? undefined : { label: '检查连接', kind: 'retry' },
       };
     case 'auth_required':
       return {
         usable: false,
         label: '需要登录',
         detail: `${where} 的登录信息缺失或已失效。`,
-        action: { label: '重新登录', section: 'sources' },
+        action: { label: '重新登录', kind: 'reconnect' },
       };
     case 'trust_required':
       return {
         usable: false,
         label: '证书待确认',
         detail: `${where} 的设备证书已变化、过期或尚未信任。`,
-        action: { label: '检查证书', section: 'sources' },
+        action: { label: '检查证书', kind: 'reconnect' },
       };
     default:
       return {
         usable: false,
         label: '访问出错',
         detail: `${where} 上次访问失败，请在连接设置中查看详情。`,
-        action: { label: '查看连接', section: 'sources' },
+        action: { label: '连接设置', kind: 'reconnect' },
       };
   }
 }

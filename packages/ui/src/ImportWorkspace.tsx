@@ -14,6 +14,8 @@ import {
   type ScanResult,
   type StorageConfig,
   type Volume,
+  type WriteCapability,
+  type WriteCheck,
 } from './model';
 import {
   availabilityPresentation,
@@ -54,6 +56,7 @@ import {
   PageHeader,
   Segmented,
   Select,
+  Spinner,
   SplitPage,
   StatusDot,
   Steps,
@@ -86,9 +89,11 @@ export default function ImportWorkspace(props: {
   onImported: (library: Library, result: ImportResult) => void;
   onOpenLibrary: (library: Library) => void;
   onCull?: (library: Library, batch: ImportBatch) => void;
-  onOpenLocations?: () => void;
-  /** Saved locations, used to show a NAS target's write status before planning. */
+  /** Saved locations, used to sync a NAS target's connection and write status. */
   sources?: StorageConfig[];
+  onWriteChecked?: (library: Library, check: WriteCheck) => void;
+  onRetryConnection?: (library: Library) => Promise<void>;
+  onReconnectSource?: (library: Library) => void;
 }) {
   const [volumes, setVolumes] = createSignal<Volume[]>([]);
   const [showAll, setShowAll] = createSignal(false);
@@ -224,6 +229,12 @@ export default function ImportWorkspace(props: {
   const [busy, setBusy] = createSignal('');
   const [error, setError] = createSignal('');
   const [scanMessage, setScanMessage] = createSignal('');
+  const [checkingTargetIds, setCheckingTargetIds] = createSignal<ReadonlySet<string>>(new Set());
+  const [targetWriteCapabilities, setTargetWriteCapabilities] = createSignal<
+    Record<string, WriteCapability>
+  >({});
+  const [targetWriteErrors, setTargetWriteErrors] = createSignal<Record<string, string>>({});
+  const autoCheckedKeys = new Set<string>();
   let initialized = false;
   const targets = () => importTargets(props.libraries);
   const [includeLikely, setIncludeLikely] = createSignal(false);
@@ -236,9 +247,11 @@ export default function ImportWorkspace(props: {
     on(
       () => props.active,
       (active) => {
-        if (active && !initialized) {
+        if (!active) return;
+        // Always refresh volumes when entering Import so newly inserted SD cards appear automatically.
+        void refreshVolumes();
+        if (!initialized) {
           initialized = true;
-          void refreshVolumes();
           void refreshHistory();
           void refreshCards();
         }
@@ -294,8 +307,14 @@ export default function ImportWorkspace(props: {
       setSelectedSources(
         new Set(next.items.filter((item) => item.status === 'pending').map((item) => item.source)),
       );
-      setPlannedTarget({ ...target });
-      setPlan(next);
+      const liveTarget = targets().find((l) => l.id === target.id) || target;
+      setPlannedTarget({ ...liveTarget });
+      const verified = targetWriteCapabilities()[target.id];
+      setPlan(
+        next.write_capability === 'unverified' && verified === 'verified'
+          ? { ...next, write_capability: 'verified' }
+          : next,
+      );
     } catch (e) {
       setError(errorMessage(e));
     } finally {
@@ -439,6 +458,91 @@ export default function ImportWorkspace(props: {
     }
     return [...groups.entries()].sort((a, b) => b[1] - a[1]);
   };
+  const isCheckingTarget = (library?: Library) =>
+    !!library && checkingTargetIds().has(library.id);
+  const writeStatus = (library?: Library): WriteCapability | undefined => {
+    if (!library || !isRemoteLibrary(library)) return undefined;
+    return (
+      targetWriteCapabilities()[library.id] ??
+      library.write_capability ??
+      locationOf(library)?.write_capability ??
+      'unverified'
+    );
+  };
+  async function recheckTarget(library: Library, manual = false) {
+    if (!desktop || !isRemoteLibrary(library) || !library.storage_id) return;
+    if (checkingTargetIds().has(library.id)) return;
+    setCheckingTargetIds((previous) => {
+      const next = new Set(previous);
+      next.add(library.id);
+      return next;
+    });
+    if (manual) {
+      setTargetWriteErrors((previous) => {
+        const next = { ...previous };
+        delete next[library.id];
+        return next;
+      });
+    }
+    try {
+      if (
+        props.onRetryConnection &&
+        (manual || !library.availability || library.availability === 'unchecked')
+      ) {
+        await props.onRetryConnection(library);
+      }
+      const check = await execute<WriteCheck>('storage.write_check', {
+        id: library.storage_id,
+        library_id: library.id,
+      });
+      setTargetWriteCapabilities((previous) => ({
+        ...previous,
+        [library.id]: check.write_capability,
+      }));
+      setTargetWriteErrors((previous) => {
+        const next = { ...previous };
+        if (check.write_capability === 'verified') delete next[library.id];
+        else if (check.error) next[library.id] = check.error;
+        else next[library.id] = '目标网络位置当前无法安全写入，请检查共享目录读写权限。';
+        return next;
+      });
+      setPlan((current) =>
+        current && (current.library_id === library.id || plannedTarget()?.id === library.id)
+          ? { ...current, write_capability: check.write_capability }
+          : current,
+      );
+      props.onWriteChecked?.(library, check);
+    } catch (e) {
+      setTargetWriteErrors((previous) => ({
+        ...previous,
+        [library.id]: errorMessage(e),
+      }));
+    } finally {
+      setCheckingTargetIds((previous) => {
+        const next = new Set(previous);
+        next.delete(library.id);
+        return next;
+      });
+    }
+  }
+  createEffect(() => {
+    if (!props.active || !desktop) return;
+    const candidate =
+      (plan()
+        ? targets().find((l) => l.id === plannedTarget()?.id) || plannedTarget()
+        : undefined) || selectedTarget();
+    if (!candidate || !isRemoteLibrary(candidate) || !candidate.storage_id) return;
+    const current = writeStatus(candidate);
+    if (current && current !== 'unverified') return;
+    const availability = candidate.availability || 'unchecked';
+    if (availability === 'auth_required' || availability === 'trust_required') return;
+    const key = `${candidate.id}:${availability}`;
+    if (autoCheckedKeys.has(key)) return;
+    autoCheckedKeys.add(key);
+    void recheckTarget(candidate, false);
+  });
+  const livePlannedTarget = () =>
+    targets().find((l) => l.id === plannedTarget()?.id) || plannedTarget();
   const writeBlocked = () => !!plan()?.write_capability && plan()!.write_capability !== 'verified';
   const splitPath = (path: string) => {
     const index = path.lastIndexOf('/');
@@ -487,7 +591,6 @@ export default function ImportWorkspace(props: {
       (v) => v.removable && (raw === v.path || raw.startsWith(`${v.path}/`)),
     )?.path;
   };
-  const writeStatus = (library?: Library) => locationOf(library)?.write_capability;
   const dateLayouts: { value: NonNullable<OrganizeRules['date_layout']>; label: string }[] = [
     { value: 'Y-M-D', label: '2026-10-22' },
     { value: 'Y/Y-M-D', label: '2026 / 2026-10-22' },
@@ -779,61 +882,93 @@ export default function ImportWorkspace(props: {
                     }
                   />
                   <Show when={selectedTarget()}>
-                    {(library) => (
-                      <ListRow
-                        title="位置"
-                        description={sourceKind(library().source_kind)}
-                        control={
-                          <>
-                            <StatusDot
-                              showLabel
-                              state={
-                                library().availability === 'online'
-                                  ? 'ok'
-                                  : availabilityPresentation(library()).usable
-                                    ? 'off'
-                                    : 'bad'
-                              }
-                              label={availabilityPresentation(library()).label}
-                            />
-                            <Show when={isRemoteLibrary(library())}>
-                              <Badge
-                                tone={
-                                  writeStatus(library()) === 'verified'
-                                    ? 'pick'
-                                    : writeStatus(library()) === 'unsupported'
-                                      ? 'reject'
-                                      : 'warn'
+                    {(library) => {
+                      const state = () => availabilityPresentation(library());
+                      const checking = () => isCheckingTarget(library());
+                      const capability = () => writeStatus(library());
+                      const probeError = () => targetWriteErrors()[library().id];
+                      const locationDesc = () => {
+                        const base = sourceKind(library().source_kind);
+                        if (!isRemoteLibrary(library())) return base;
+                        if (capability() === 'unsupported')
+                          return `${base} · 该位置无法保证不覆盖已有文件，不可作为导入目标`;
+                        if (probeError()) return `${base} · ${probeError()}`;
+                        return base;
+                      };
+                      return (
+                        <ListRow
+                          title="位置"
+                          description={locationDesc()}
+                          control={
+                            <>
+                              <StatusDot
+                                showLabel
+                                state={
+                                  library().availability === 'online'
+                                    ? 'ok'
+                                    : state().usable
+                                      ? 'off'
+                                      : 'bad'
                                 }
-                              >
-                                {writeStatus(library()) === 'verified'
-                                  ? '可写入'
-                                  : writeStatus(library()) === 'unsupported'
-                                    ? '不可写入'
-                                    : '需测试写入'}
-                              </Badge>
-                            </Show>
-                          </>
-                        }
-                      />
-                    )}
-                  </Show>
-                  <Show
-                    when={
-                      isRemoteLibrary(selectedTarget()) &&
-                      writeStatus(selectedTarget()) !== 'verified' &&
-                      props.onOpenLocations
-                    }
-                  >
-                    <ListRow
-                      title="写入测试"
-                      description="导入到网络位置前，需要先在“位置”中测试写入。"
-                      control={
-                        <Button size="sm" onClick={props.onOpenLocations}>
-                          去测试写入
-                        </Button>
-                      }
-                    />
+                                label={state().label}
+                              />
+                              <Show when={isRemoteLibrary(library())}>
+                                <Show
+                                  when={!checking()}
+                                  fallback={
+                                    <Badge tone="neutral">
+                                      <Spinner size="sm" />
+                                      正在检测写入…
+                                    </Badge>
+                                  }
+                                >
+                                  <Badge
+                                    tone={
+                                      capability() === 'verified'
+                                        ? 'pick'
+                                        : capability() === 'unsupported'
+                                          ? 'reject'
+                                          : probeError() || !state().usable
+                                            ? 'warn'
+                                            : 'neutral'
+                                    }
+                                  >
+                                    {capability() === 'verified'
+                                      ? '可写入'
+                                      : capability() === 'unsupported'
+                                        ? '不可写入'
+                                        : probeError() || !state().usable
+                                          ? '暂不可写'
+                                          : '自动检测'}
+                                  </Badge>
+                                </Show>
+                                <Show
+                                  when={
+                                    state().action?.kind === 'reconnect' && props.onReconnectSource
+                                  }
+                                >
+                                  <Button
+                                    size="sm"
+                                    onClick={() => props.onReconnectSource!(library())}
+                                    disabled={!!busy()}
+                                  >
+                                    {state().action!.label}
+                                  </Button>
+                                </Show>
+                                <IconButton
+                                  icon="refresh"
+                                  size="sm"
+                                  label="刷新连接与写入状态"
+                                  title="重新检测连接与写入状态"
+                                  disabled={checking() || !!busy()}
+                                  onClick={() => void recheckTarget(library(), true)}
+                                />
+                              </Show>
+                            </>
+                          }
+                        />
+                      );
+                    }}
                   </Show>
                   <ListRow
                     title="包含视频文件"
@@ -1152,16 +1287,42 @@ export default function ImportWorkspace(props: {
               </Show>
               <Show when={writeBlocked()}>
                 <Banner
-                  tone="warn"
+                  tone={isCheckingTarget(livePlannedTarget()) ? 'info' : 'warn'}
                   message={
                     plan()!.write_capability === 'unsupported'
                       ? '这个网络位置无法保证不覆盖已有文件，Lumen 不会向它导入。'
-                      : '导入前需要先在“位置”中对这个网络位置“测试写入”，确认它能安全地新建文件且不覆盖已有内容。'
+                      : isCheckingTarget(livePlannedTarget())
+                        ? '正在自动验证该网络位置的安全写入权限，完成后即可开始导入…'
+                        : (livePlannedTarget() && targetWriteErrors()[livePlannedTarget()!.id]) ||
+                          '当前网络位置尚未通过安全写入验证，请检查读写权限或连接状态后刷新重试。'
                   }
                   action={
-                    <Show when={props.onOpenLocations && plan()!.write_capability === 'unverified'}>
-                      <Button size="sm" onClick={props.onOpenLocations}>
-                        前往位置
+                    <Show when={livePlannedTarget() && isRemoteLibrary(livePlannedTarget())}>
+                      <Show
+                        when={
+                          livePlannedTarget() &&
+                          availabilityPresentation(livePlannedTarget()!).action?.kind ===
+                            'reconnect' &&
+                          props.onReconnectSource
+                        }
+                      >
+                        <Button
+                          size="sm"
+                          onClick={() => props.onReconnectSource!(livePlannedTarget()!)}
+                          disabled={!!busy()}
+                        >
+                          {availabilityPresentation(livePlannedTarget()!).action!.label}
+                        </Button>
+                      </Show>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        disabled={isCheckingTarget(livePlannedTarget()) || !!busy()}
+                        onClick={() =>
+                          livePlannedTarget() && void recheckTarget(livePlannedTarget()!, true)
+                        }
+                      >
+                        {isCheckingTarget(livePlannedTarget()) ? '正在检测…' : '重新检测'}
                       </Button>
                     </Show>
                   }

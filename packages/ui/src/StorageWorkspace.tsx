@@ -1,4 +1,4 @@
-import { For, Show, createSignal } from 'solid-js';
+import { For, Show, createEffect, createSignal } from 'solid-js';
 import { chooseSave, desktop, execute } from './api';
 import {
   bytes,
@@ -11,10 +11,21 @@ import {
 } from './model';
 import { checkedConnection, credentialLabel, parentPrefix, sourceKind } from './workspace';
 import Icon from './Icon';
-import { Banner, Button, EmptyState, Group, IconButton, ListRow, PageHeader, StatusDot } from './ui';
+import {
+  Badge,
+  Banner,
+  Button,
+  EmptyState,
+  Group,
+  IconButton,
+  ListRow,
+  PageHeader,
+  StatusDot,
+} from './ui';
 import StorageError from './StorageError';
 
 export default function StorageWorkspace(props: {
+  active?: boolean;
   sources: StorageConfig[];
   checkingIds?: ReadonlySet<string>;
   removableLibraries?: Library[];
@@ -35,9 +46,43 @@ export default function StorageWorkspace(props: {
   const [errorSourceId, setErrorSourceId] = createSignal<string>();
   const [notice, setNotice] = createSignal('');
   const [checks, setChecks] = createSignal<Record<string, { ok: boolean; message: string }>>({});
+  const [probingWriteIds, setProbingWriteIds] = createSignal<ReadonlySet<string>>(new Set());
+  const autoProbedWriteIds = new Set<string>();
   let request = 0;
   const remoteSources = () => props.sources.filter((item) => item.kind !== 'local');
   const source = () => remoteSources().find((item) => item.id === selected());
+  async function verifyWriteSilent(item: StorageConfig) {
+    if (!desktop || item.kind === 'local' || probingWriteIds().has(item.id)) return;
+    setProbingWriteIds((previous) => {
+      const next = new Set(previous);
+      next.add(item.id);
+      return next;
+    });
+    try {
+      const result = await execute<WriteCheck>('storage.write_check', { id: item.id });
+      const latest = props.sources.find((s) => s.id === item.id) || item;
+      props.onUpdated({ ...latest, write_capability: result.write_capability });
+    } catch {
+      /* Silent background probe; connection errors are surfaced by storage.check. */
+    } finally {
+      setProbingWriteIds((previous) => {
+        const next = new Set(previous);
+        next.delete(item.id);
+        return next;
+      });
+    }
+  }
+  createEffect(() => {
+    if (!props.active || !desktop) return;
+    for (const item of remoteSources()) {
+      const online = item.connected || item.availability === 'online';
+      if (!online) continue;
+      if (item.write_capability && item.write_capability !== 'unverified') continue;
+      if (autoProbedWriteIds.has(item.id)) continue;
+      autoProbedWriteIds.add(item.id);
+      void verifyWriteSilent(item);
+    }
+  });
   async function check(item: StorageConfig) {
     setErrorSourceId(item.id);
     setBusy(item.id);
@@ -47,39 +92,27 @@ export default function StorageWorkspace(props: {
       const result = await execute<StorageCheck>('storage.check', { id: item.id });
       const status = checkedConnection(result);
       setChecks((previous) => ({ ...previous, [item.id]: status }));
+      let writeCapability = item.write_capability;
+      if (result.connected && item.kind !== 'local') {
+        try {
+          const writeResult = await execute<WriteCheck>('storage.write_check', { id: item.id });
+          writeCapability = writeResult.write_capability;
+        } catch {
+          /* Keep previous write capability if connection succeeded but write check errored. */
+        }
+      }
       props.onUpdated({
         ...item,
         connected: result.connected,
         availability: result.availability ?? (result.connected ? 'online' : 'error'),
         credential_status: result.credential_status,
+        ...(writeCapability ? { write_capability: writeCapability } : {}),
       });
       if (!status.ok) setError(status.message);
     } catch (e) {
       const message = errorMessage(e);
       setError(message);
       setChecks((previous) => ({ ...previous, [item.id]: { ok: false, message } }));
-    } finally {
-      setBusy('');
-    }
-  }
-  /** Explicit: writes and removes one small test object on the server. */
-  async function writeCheck(item: StorageConfig) {
-    setErrorSourceId(item.id);
-    setBusy(item.id);
-    setError('');
-    setNotice('');
-    try {
-      const result = await execute<WriteCheck>('storage.write_check', { id: item.id });
-      props.onUpdated({ ...item, write_capability: result.write_capability });
-      if (result.write_capability === 'verified')
-        setNotice(
-          `${item.name} 可以安全导入：新建文件经读回校验，已有文件不会被覆盖。${result.leftover ? `测试文件 ${result.leftover} 未能删除，可手动清理。` : ''}`,
-        );
-      else if (result.write_capability === 'unsupported')
-        setError(`${item.name} 无法保证不覆盖已有文件，不能作为导入目标。${result.error || ''}`);
-      else setError(result.error || '写入测试未完成。');
-    } catch (e) {
-      setError(errorMessage(e));
     } finally {
       setBusy('');
     }
@@ -245,6 +278,29 @@ export default function StorageWorkspace(props: {
                     <strong>
                       {item.name}
                       <small>{sourceKind(item.kind)}</small>
+                      <Show
+                        when={item.kind !== 'local' && (item.connected || item.availability === 'online')}
+                      >
+                        <Badge
+                          tone={
+                            probingWriteIds().has(item.id)
+                              ? 'neutral'
+                              : item.write_capability === 'verified'
+                                ? 'pick'
+                                : item.write_capability === 'unsupported'
+                                  ? 'reject'
+                                  : 'neutral'
+                          }
+                        >
+                          {probingWriteIds().has(item.id)
+                            ? '检测写入中…'
+                            : item.write_capability === 'verified'
+                              ? '可写入'
+                              : item.write_capability === 'unsupported'
+                                ? '不可导入'
+                                : '只读'}
+                        </Badge>
+                      </Show>
                     </strong>
                     <p title={item.endpoint}>
                       {item.endpoint}
@@ -272,20 +328,6 @@ export default function StorageWorkspace(props: {
                   <Button size="sm" onClick={() => browse(item)} disabled={!!busy()}>
                     浏览目录
                   </Button>
-                  <Show when={item.kind !== 'local'}>
-                    <Button
-                      size="sm"
-                      onClick={() => writeCheck(item)}
-                      disabled={!!busy()}
-                      title="写入并删除一个测试文件，确认可以安全导入到这里"
-                    >
-                      {item.write_capability === 'verified'
-                        ? '可导入'
-                        : item.write_capability === 'unsupported'
-                          ? '不可导入'
-                          : '测试写入'}
-                    </Button>
-                  </Show>
                   <IconButton
                     icon="settings"
                     size="sm"

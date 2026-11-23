@@ -158,6 +158,7 @@ struct SourceState {
     availability: Arc<AvailabilityCell>,
     /// Result of the explicit write test in this process; reset when the source changes.
     write: Arc<std::sync::atomic::AtomicU8>,
+    prefix_writes: Arc<Mutex<HashMap<String, WriteCapability>>>,
 }
 
 fn unchecked() -> String {
@@ -212,6 +213,7 @@ impl StorageRegistry {
                     credential_status: config.credential_status.clone(),
                     availability: Arc::new(AvailabilityCell::default()),
                     write: Arc::default(),
+                    prefix_writes: Arc::default(),
                 },
             );
         }
@@ -461,6 +463,7 @@ impl StorageRegistry {
                     credential_status: config.credential_status.clone(),
                     availability: Arc::new(AvailabilityCell::default()),
                     write: Arc::default(),
+                    prefix_writes: Arc::default(),
                 },
             );
         Ok(config)
@@ -610,6 +613,34 @@ impl StorageRegistry {
             .unwrap_or(WriteCapability::Unverified)
     }
 
+    /// Write capability for a specific prefix (such as a library's `source_prefix`).
+    pub fn write_capability_at(&self, id: &str, prefix: &str) -> WriteCapability {
+        let trimmed = prefix.trim_matches('/');
+        self.states
+            .lock()
+            .ok()
+            .and_then(|states| {
+                let state = states.get(id)?;
+                if WriteCapability::load(&state.write) == WriteCapability::Unsupported {
+                    return Some(WriteCapability::Unsupported);
+                }
+                if let Ok(map) = state.prefix_writes.lock() {
+                    if let Some(capability) = map.get(trimmed).copied() {
+                        return Some(capability);
+                    }
+                    if !trimmed.is_empty() && map.get("") == Some(&WriteCapability::Verified) {
+                        return Some(WriteCapability::Verified);
+                    }
+                }
+                if trimmed.is_empty() {
+                    Some(WriteCapability::load(&state.write))
+                } else {
+                    Some(WriteCapability::Unverified)
+                }
+            })
+            .unwrap_or(WriteCapability::Unverified)
+    }
+
     /// A write snapshot for a WebDAV or S3 location. No network I/O happens here.
     pub fn open_writer(&self, id: &str) -> Result<RemoteWriter> {
         let config = self.config(id)?.clone();
@@ -631,6 +662,7 @@ impl StorageRegistry {
             client,
             state.availability.clone(),
             state.write.clone(),
+            state.prefix_writes.clone(),
         ))
     }
 

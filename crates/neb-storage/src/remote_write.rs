@@ -15,7 +15,7 @@ use reqwest::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::{Cursor, Read},
     sync::{
         atomic::{AtomicU8, Ordering},
@@ -88,6 +88,8 @@ impl WriteCapability {
 #[derive(Debug, Serialize)]
 pub struct WriteCheck {
     pub id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
     pub write_capability: String,
     pub error: Option<String>,
     /// Test object that could not be removed, if any; reported, never hidden.
@@ -103,6 +105,7 @@ pub struct RemoteWriter {
     client: Client,
     availability: Arc<AvailabilityCell>,
     capability: Arc<AtomicU8>,
+    prefix_capabilities: Arc<Mutex<HashMap<String, WriteCapability>>>,
     collections: Mutex<HashSet<String>>,
     collection_gate: Mutex<()>,
 }
@@ -121,6 +124,7 @@ impl RemoteWriter {
         client: Client,
         availability: Arc<AvailabilityCell>,
         capability: Arc<AtomicU8>,
+        prefix_capabilities: Arc<Mutex<HashMap<String, WriteCapability>>>,
     ) -> Self {
         Self {
             config,
@@ -128,6 +132,7 @@ impl RemoteWriter {
             client,
             availability,
             capability,
+            prefix_capabilities,
             collections: Mutex::new(HashSet::new()),
             collection_gate: Mutex::new(()),
         }
@@ -145,6 +150,26 @@ impl RemoteWriter {
         WriteCapability::load(&self.capability)
     }
 
+    pub fn capability_at(&self, prefix: &str) -> WriteCapability {
+        let trimmed = prefix.trim_matches('/');
+        if WriteCapability::load(&self.capability) == WriteCapability::Unsupported {
+            return WriteCapability::Unsupported;
+        }
+        if let Ok(map) = self.prefix_capabilities.lock() {
+            if let Some(capability) = map.get(trimmed).copied() {
+                return capability;
+            }
+            if !trimmed.is_empty() && map.get("") == Some(&WriteCapability::Verified) {
+                return WriteCapability::Verified;
+            }
+        }
+        if trimmed.is_empty() {
+            WriteCapability::load(&self.capability)
+        } else {
+            WriteCapability::Unverified
+        }
+    }
+
     /// Conflicts and verification failures are about content, not connectivity.
     fn track<T>(&self, result: Result<T>) -> Result<T> {
         match &result {
@@ -155,9 +180,10 @@ impl RemoteWriter {
         result
     }
 
-    /// Sidecar writes on read-only WebDAV shares or read-only S3 IAM policies fail with
-    /// HTTP 403 / 405 even when read credentials are valid; never poison read availability.
-    fn track_sidecar_write<T>(&self, result: Result<T>) -> Result<T> {
+    /// Writes on read-only WebDAV shares, virtual server roots, or read-only S3 IAM
+    /// policies fail with HTTP 403 / 405 even when read credentials are valid; never
+    /// poison read availability on write-permission errors.
+    fn track_write<T>(&self, result: Result<T>) -> Result<T> {
         match &result {
             Ok(_) => self.availability.set(Availability::Online),
             Err(error) if !code(error) => {
@@ -243,7 +269,7 @@ impl RemoteWriter {
                 "E_INVALID: Expected SHA-256 must be 64 lowercase/uppercase hex digits"
             );
         }
-        self.track(match self.config.kind.as_str() {
+        self.track_write(match self.config.kind.as_str() {
             "webdav" => self.dav_put_new(key, body, size, expected_sha256),
             "s3" => {
                 let sha256 = expected_sha256.ok_or_else(|| {
@@ -258,7 +284,7 @@ impl RemoteWriter {
 
     pub fn delete(&self, key: &str) -> Result<()> {
         validate_key(key, false)?;
-        self.track((|| {
+        self.track_write((|| {
             let request = if self.config.kind == "s3" {
                 self.s3(Method::DELETE, key, EMPTY_SHA256)?
             } else {
@@ -272,6 +298,22 @@ impl RemoteWriter {
             );
             Ok(())
         })())
+    }
+
+    fn dav_collection_exists(&self, directory: &str) -> bool {
+        let Ok(mut url) = remote::url_for(&self.config, directory) else {
+            return false;
+        };
+        if !url.path().ends_with('/') {
+            url.set_path(&format!("{}/", url.path()));
+        }
+        let Ok(propfind) = Method::from_bytes(b"PROPFIND") else {
+            return false;
+        };
+        remote::dav_request(&self.client, &self.credentials, propfind, url)
+            .header("Depth", "0")
+            .send()
+            .is_ok_and(|response| response.status().is_success())
     }
 
     fn dav_collections(&self, directory: &str) -> Result<()> {
@@ -306,9 +348,16 @@ impl RemoteWriter {
                 .dav(Method::from_bytes(b"MKCOL")?, &prefix)?
                 .send()?
                 .status();
-            // 405 means the collection already exists.
+            // 405 means the collection already exists; NAS WebDAV roots (Synology/QNAP)
+            // may return 403/409/301 on existing top-level shared folders.
+            let exists = status.is_success()
+                || status == StatusCode::METHOD_NOT_ALLOWED
+                || ((status == StatusCode::FORBIDDEN
+                    || status == StatusCode::CONFLICT
+                    || status.is_redirection())
+                    && self.dav_collection_exists(&prefix));
             ensure!(
-                status.is_success() || status == StatusCode::METHOD_NOT_ALLOWED,
+                exists,
                 "Cannot create folder {prefix}: HTTP {}",
                 status.as_u16()
             );
@@ -351,7 +400,7 @@ impl RemoteWriter {
             "E_LIMIT: Remote XMP sidecar exceeds 2 MiB limit"
         );
         let sha256 = hex::encode(Sha256::digest(bytes));
-        self.track_sidecar_write(match self.config.kind.as_str() {
+        self.track_write(match self.config.kind.as_str() {
             "webdav" => self.dav_put_sidecar(key, bytes, &sha256, !create_only),
             "s3" => self.s3_put_sidecar(key, bytes, &sha256, expected_etag, create_only),
             _ => bail!("E_UNSUPPORTED: Only WebDAV and S3 locations accept remote writes"),
@@ -602,10 +651,32 @@ impl RemoteWriter {
         }
     }
 
-    /// Explicit write test: publish a small object, prove a second write to the same
-    /// key is refused, then remove it. Records the result for this process.
+    /// Explicit write test at storage root: publish a small object, prove a second
+    /// write to the same key is refused, then remove it. Records the result for this process.
     pub fn probe(&self) -> WriteCheck {
-        let key = format!(".nebulume-write-test-{}.txt", Uuid::new_v4());
+        self.probe_at("")
+    }
+
+    /// Scoped write test inside `prefix` (e.g. a library's `source_prefix` such as a
+    /// NAS shared folder `Z30` when the storage endpoint itself sits at virtual `/`).
+    pub fn probe_at(&self, prefix: &str) -> WriteCheck {
+        let trimmed = prefix.trim_matches('/');
+        if let Err(error) = validate_key(trimmed, true) {
+            return WriteCheck {
+                id: self.config.id.clone(),
+                prefix: trimmed.to_owned(),
+                write_capability: WriteCapability::Unverified.as_str().into(),
+                error: Some(format!("{error:#}")),
+                leftover: None,
+                checked_at: chrono::Utc::now().to_rfc3339(),
+            };
+        }
+        let name = format!(".nebulume-write-test-{}.txt", Uuid::new_v4());
+        let key = if trimmed.is_empty() {
+            name
+        } else {
+            format!("{trimmed}/{name}")
+        };
         let first = b"nebulume write test\n".to_vec();
         let second = b"nebulume overwrite attempt\n".to_vec();
         let hash = |bytes: &[u8]| hex::encode(Sha256::digest(bytes));
@@ -639,9 +710,20 @@ impl RemoteWriter {
             }
             Err(_) => WriteCapability::Unverified,
         };
-        self.capability.store(capability as u8, Ordering::Relaxed);
+        if let Ok(mut map) = self.prefix_capabilities.lock() {
+            map.insert(trimmed.to_owned(), capability);
+        }
+        if trimmed.is_empty() || capability == WriteCapability::Unsupported {
+            self.capability.store(capability as u8, Ordering::Relaxed);
+        } else if capability == WriteCapability::Verified
+            && WriteCapability::load(&self.capability) == WriteCapability::Unverified
+        {
+            self.capability
+                .store(WriteCapability::Verified as u8, Ordering::Relaxed);
+        }
         WriteCheck {
             id: self.config.id.clone(),
+            prefix: trimmed.to_owned(),
             write_capability: capability.as_str().into(),
             error: result.err().map(|error| format!("{error:#}")),
             leftover,

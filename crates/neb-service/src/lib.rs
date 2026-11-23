@@ -594,19 +594,37 @@ impl Service {
         params: &Value,
     ) -> Result<Value> {
         let _active_guard = ActiveImportGuard::acquire(&self.import_progress)?;
-        let writer = {
+        let (writer, capability) = {
             let storage = self
                 .storage
                 .lock()
                 .map_err(|_| anyhow!("Storage state unavailable"))?;
-            // Only a location that passed the explicit write test accepts imports.
-            ensure!(
-                storage.write_capability(&source.id) == neb_storage::WriteCapability::Verified,
-                "E_WRITE_UNVERIFIED: Test writing to {} in Locations before importing to it",
-                source.name
-            );
-            storage.open_writer(&source.id)?
+            let capability = storage.write_capability_at(&source.id, &library.source_prefix);
+            (storage.open_writer(&source.id)?, capability)
         };
+        match capability {
+            neb_storage::WriteCapability::Verified => {}
+            neb_storage::WriteCapability::Unsupported => {
+                anyhow::bail!(
+                    "E_UNSUPPORTED: {} does not support safe non-overwriting writes",
+                    source.name
+                );
+            }
+            neb_storage::WriteCapability::Unverified => {
+                // Verify safe non-overwriting write support automatically in-place
+                // inside the target library prefix before uploading any asset.
+                let check = writer.probe_at(&library.source_prefix);
+                if check.write_capability != "verified" {
+                    anyhow::bail!(
+                        "{}",
+                        check.error.unwrap_or_else(|| format!(
+                            "E_WRITE_UNVERIFIED: Cannot safely write to {}",
+                            source.name
+                        ))
+                    );
+                }
+            }
+        }
         let include_likely = params
             .get("include_likely_duplicates")
             .and_then(Value::as_bool)
@@ -825,6 +843,13 @@ impl Service {
         };
         value["connected"] = json!(availability == "online");
         value["availability"] = json!(availability);
+        if let Some(s) = source.as_ref().filter(|s| s.kind != "local") {
+            if let Ok(storage) = self.storage.lock() {
+                value["write_capability"] = json!(storage
+                    .write_capability_at(&s.id, &library.source_prefix)
+                    .as_str());
+            }
+        }
         if source.as_ref().is_none_or(|s| s.kind == "local") {
             let (removable, volume_label, relocatable_path) =
                 detect_removable_library_mount(&library.root, availability == "online");
@@ -1341,14 +1366,60 @@ impl Service {
             )?),
             "storage.remove" => self.remove_storage(string(&params, "id")?),
             "storage.write_check" => {
-                // Explicit: writes and removes one small test object on the server.
+                // Writes and removes one small test object on the server, scoped to the
+                // target library prefix when provided (or falling back to a library prefix
+                // when the storage endpoint sits at a virtual NAS root).
                 let id = string(&params, "id")?;
-                let writer = self
-                    .storage
-                    .lock()
-                    .map_err(|_| anyhow!("Storage state unavailable"))?
-                    .open_writer(id)?;
-                Ok(serde_json::to_value(writer.probe())?)
+                let explicit_prefix = if let Some(library_id) = params
+                    .get("library_id")
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty())
+                {
+                    let library = self.core.library(library_id)?;
+                    ensure!(
+                        library.storage_id.as_deref() == Some(id),
+                        "E_INVALID: Library does not belong to storage {id}"
+                    );
+                    Some(library.source_prefix)
+                } else {
+                    params
+                        .get("prefix")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                };
+                let (writer, root_empty) = {
+                    let storage = self
+                        .storage
+                        .lock()
+                        .map_err(|_| anyhow!("Storage state unavailable"))?;
+                    let root_empty = storage
+                        .list()
+                        .into_iter()
+                        .find(|c| c.id == id)
+                        .is_some_and(|c| c.root.trim_matches('/').is_empty());
+                    (storage.open_writer(id)?, root_empty)
+                };
+                let check = if let Some(prefix) = explicit_prefix {
+                    writer.probe_at(&prefix)
+                } else {
+                    let root_check = writer.probe();
+                    if root_check.write_capability == "unverified" && root_empty {
+                        let fallback_prefix = self.core.libraries().ok().and_then(|libs| {
+                            libs.into_iter().find_map(|lib| {
+                                (lib.storage_id.as_deref() == Some(id)
+                                    && !lib.source_prefix.trim_matches('/').is_empty())
+                                .then_some(lib.source_prefix)
+                            })
+                        });
+                        match fallback_prefix {
+                            Some(prefix) => writer.probe_at(&prefix),
+                            None => root_check,
+                        }
+                    } else {
+                        root_check
+                    }
+                };
+                Ok(serde_json::to_value(check)?)
             }
             "storage.probe" => {
                 let request: AddStorageRequest =
@@ -1470,7 +1541,7 @@ impl Service {
                         .storage
                         .lock()
                         .map_err(|_| anyhow!("Storage state unavailable"))?
-                        .write_capability(&source.id)
+                        .write_capability_at(&source.id, &library.source_prefix)
                         .as_str());
                     return Ok(plan);
                 }
