@@ -4,6 +4,8 @@
 
 ## 本版本验证
 
+0.2.6（2026-11-22）完成 WebDAV / S3 远端存储库无损双向 `.xmp` 伴随同步（`RemoteXmpSyncer` 后台防抖队列、原子/条件更新与无条件头兼容 S3 平滑回退、目录级 `.xmp` 索引、远端 `RAW + JPEG` 配对同步、受限 NAS 共享根 `MKCOL` 按需回退及只读 `403/405` 在线可用性保护）。本机 Windows x64 全量验证覆盖 Rust workspace（364 项通过、3 项平台隔离测试默认显式忽略）、`rustfmt`、Clippy（`-D warnings`）、设计系统门禁（`check:design` 0 例外）、204 项 UI 单元测试、前端生产构建与 17 项发布脚本单测；Windows x64 与 macOS Universal 双平台安装包、Playwright 浏览器全流程、真实 Rust/UI bridge（`smoke.mjs --ui`）、更新包签名及回读核验由 GitHub Actions `Validate` 与 `Release` 工作流执行。
+
 0.2.5（2026-11-16）完成视频索引、远端有界 Range 相机内嵌封面与元数据解析（Nikon `NCDT/NCTG`、Canon `CMT/CNTH`、Sony `NonRealTimeMeta`、QuickTime `mdta/udta`）、回环分段流媒体与自研暗房播放控制栏、惰性指纹抽样与单遍流式并发导入、默认排序偏好、`[` / `]` 星级步进与选片防抖自动推进，以及概览筛选双向同步与窄窗口工具栏收敛。本机 macOS 全量验证覆盖 Rust workspace（369 项通过、2 项默认显式忽略）、`rustfmt`、Clippy（`-D warnings`）、设计系统门禁（`check:design` 0 例外）、204 项 UI 单元测试、171 项 Playwright 浏览器全流程、17 项发布脚本单测及真实 Rust/UI bridge（`smoke.mjs --ui`）；Windows x64 与 macOS Universal 双平台安装包、更新包签名及回读核验由 GitHub Actions `Release` 工作流执行。
 
 0.2.4（2026-11-14）完成 Nikon Z5 II（`NIKON Z5_2`）无损压缩 NEF 传感器显影与导出（`rawler 0.8.0` 定向接入、`8 MiB` 栈隔离、有界 EXIF 读取与存量缓存一次性定向刷新）、Nikon Expeed 7 `AFInfo2` `0400/0401/0402` 对焦区域叠加、应用内更新分层交互改造、浅色主题品牌徽标桌面 CSP 修复及全局顶层 Portal `[data-tooltip]` 重构。范围与实片复现方法见下文「Nikon Z5 II 验证」；本机 macOS 全量验证覆盖 Rust workspace（含 `neb-app`）、`rustfmt`、Clippy（`-D warnings`）、设计系统门禁（`check:design` 0 例外）、UI 单元测试、Playwright 浏览器全流程与发布脚本单测；Windows x64 与 macOS Universal 双平台安装包、更新包签名及回读核验由 GitHub Actions `Release` 工作流执行。
